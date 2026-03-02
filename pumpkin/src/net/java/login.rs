@@ -112,54 +112,11 @@ impl JavaClient {
         log::debug!("Handling encryption");
 
         // Verify the verification token (Requirements 5.1, 5.2, 5.3, 5.4)
-        let pending_login = server.take_pending_login(self.id).await;
-        match pending_login {
-            Some(pending) => {
-                // Check for timeout (Requirements 5.4)
-                if pending.is_expired() {
-                    log::warn!(
-                        "Client {} login timeout - verification token expired",
-                        self.id
-                    );
-                    self.kick(TextComponent::text("Login timeout")).await;
-                    return;
-                }
-
-                // Decrypt and verify the token (Requirements 5.2, 5.3)
-                let decrypted_token = match server.decrypt(&encryption_response.verify_token) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        log::warn!(
-                            "Client {} failed to decrypt verification token: {}",
-                            self.id,
-                            error
-                        );
-                        self.kick(TextComponent::text("Invalid verification token"))
-                            .await;
-                        return;
-                    }
-                };
-
-                // Compare tokens (Requirements 5.2, 5.3)
-                if decrypted_token.as_slice() != pending.verification_token {
-                    log::warn!(
-                        "Client {} verification token mismatch - possible MITM attack",
-                        self.id
-                    );
-                    self.kick(TextComponent::text("Verification token mismatch"))
-                        .await;
-                    return;
-                }
-            }
-            None => {
-                log::warn!(
-                    "Client {} sent encryption response without pending login",
-                    self.id
-                );
-                self.kick(TextComponent::text("No pending login found"))
-                    .await;
-                return;
-            }
+        if !self
+            .verify_pending_login(server, &encryption_response)
+            .await
+        {
+            return;
         }
 
         let shared_secret = match server.decrypt(&encryption_response.shared_secret) {
@@ -246,6 +203,61 @@ impl JavaClient {
         }
 
         self.finish_login(profile).await;
+    }
+
+    /// Verifies the pending login token. Returns `true` if verification passed.
+    async fn verify_pending_login(
+        &self,
+        server: &Server,
+        encryption_response: &SEncryptionResponse,
+    ) -> bool {
+        let pending_login = server.take_pending_login(self.id).await;
+        if let Some(pending) = pending_login {
+            // Check for timeout (Requirements 5.4)
+            if pending.is_expired() {
+                log::warn!(
+                    "Client {} login timeout - verification token expired",
+                    self.id
+                );
+                self.kick(TextComponent::text("Login timeout")).await;
+                return false;
+            }
+
+            // Decrypt and verify the token (Requirements 5.2, 5.3)
+            let decrypted_token = match server.decrypt(&encryption_response.verify_token) {
+                Ok(token) => token,
+                Err(error) => {
+                    log::warn!(
+                        "Client {} failed to decrypt verification token: {}",
+                        self.id,
+                        error
+                    );
+                    self.kick(TextComponent::text("Invalid verification token"))
+                        .await;
+                    return false;
+                }
+            };
+
+            // Compare tokens (Requirements 5.2, 5.3)
+            if decrypted_token.as_slice() != pending.verification_token {
+                log::warn!(
+                    "Client {} verification token mismatch - possible MITM attack",
+                    self.id
+                );
+                self.kick(TextComponent::text("Verification token mismatch"))
+                    .await;
+                return false;
+            }
+        } else {
+            log::warn!(
+                "Client {} sent encryption response without pending login",
+                self.id
+            );
+            self.kick(TextComponent::text("No pending login found"))
+                .await;
+            return false;
+        }
+        true
     }
 
     async fn enable_compression(&self, server: &Server) {

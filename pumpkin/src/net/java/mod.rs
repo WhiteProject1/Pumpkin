@@ -723,7 +723,7 @@ mod tests {
     use std::time::Duration;
 
     /// Helper struct to test packet rate limiting logic without needing a real TCP connection.
-    /// This mirrors the rate limiting implementation in JavaClient.
+    /// This mirrors the rate limiting implementation in `JavaClient`.
     struct PacketRateLimiter {
         packet_count: AtomicU32,
         window_start: Mutex<Instant>,
@@ -761,7 +761,7 @@ mod tests {
         }
     }
 
-    /// Property test: For any client sending more than MAX_PACKETS_PER_SECOND packets,
+    /// Property test: For any client sending more than `MAX_PACKETS_PER_SECOND` packets,
     /// excess packets SHALL be rejected and client disconnected.
     /// **Feature: security-hardening, Property 5: Packet Rate Limit**
     /// **Validates: Requirements 4.2, 4.3**
@@ -858,7 +858,7 @@ mod tests {
         );
     }
 
-    /// Test that MAX_PACKETS_PER_SECOND constant is set to 500 as per requirements.
+    /// Test that `MAX_PACKETS_PER_SECOND` constant is set to 500 as per requirements.
     /// **Feature: security-hardening, Property 5: Packet Rate Limit**
     /// **Validates: Requirements 4.2**
     #[test]

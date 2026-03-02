@@ -35,7 +35,7 @@ pub enum BungeeCordError {
 /// determine the player's information locally.
 ///
 /// # IP Whitelist
-/// If `allowed_ips` is configured in the BungeeCord config, only connections
+/// If `allowed_ips` is configured in the `BungeeCord` config, only connections
 /// from those IP addresses will be accepted. If the list is empty, all IPs are allowed.
 pub async fn bungeecord_login(
     client_address: &Mutex<SocketAddr>,
@@ -49,8 +49,7 @@ pub async fn bungeecord_login(
     // IP whitelist validation
     if !config.allowed_ips.is_empty() && !config.allowed_ips.contains(&client_ip) {
         log::warn!(
-            "BungeeCord connection rejected from non-whitelisted IP: {}",
-            client_ip
+            "BungeeCord connection rejected from non-whitelisted IP: {client_ip}",
         );
         return Err(BungeeCordError::ProxyNotAllowed);
     }
@@ -98,7 +97,7 @@ mod tests {
     use proptest::prelude::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
-    /// Helper to create a BungeeCordConfig with allowed IPs
+    /// Helper to create a `BungeeCordConfig` with allowed IPs
     fn config_with_allowed_ips(allowed_ips: Vec<IpAddr>) -> BungeeCordConfig {
         BungeeCordConfig {
             enabled: true,
@@ -111,13 +110,13 @@ mod tests {
         Mutex::new(SocketAddr::V4(SocketAddrV4::new(
             match ip {
                 IpAddr::V4(v4) => v4,
-                IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1), // fallback for test
+                IpAddr::V6(_) => Ipv4Addr::LOCALHOST, // fallback for test
             },
             12345,
         )))
     }
 
-    /// Property test: For any BungeeCord connection, if allowed_ips is configured,
+    /// Property test: For any `BungeeCord` connection, if `allowed_ips` is configured,
     /// only connections from those IPs SHALL be accepted.
     /// **Feature: security-hardening, Property 3: Proxy IP Whitelist**
     /// **Validates: Requirements 3.2**
@@ -162,9 +161,7 @@ mod tests {
 
             assert!(
                 matches!(result, Err(BungeeCordError::ProxyNotAllowed)),
-                "Connection from non-whitelisted IP {} should be rejected when whitelist contains {}",
-                client_ip,
-                allowed_ip
+                "Connection from non-whitelisted IP {client_ip} should be rejected when whitelist contains {allowed_ip}",
             );
         }
     }
@@ -197,8 +194,7 @@ mod tests {
             // Should not be ProxyNotAllowed error (may fail for other reasons like parsing)
             assert!(
                 !matches!(result, Err(BungeeCordError::ProxyNotAllowed)),
-                "Connection from whitelisted IP {} should not be rejected as ProxyNotAllowed",
-                ip
+                "Connection from whitelisted IP {ip} should not be rejected as ProxyNotAllowed",
             );
         }
     }
@@ -231,8 +227,7 @@ mod tests {
             // Should not be ProxyNotAllowed error (empty whitelist allows all)
             assert!(
                 !matches!(result, Err(BungeeCordError::ProxyNotAllowed)),
-                "Connection from any IP {} should be allowed when whitelist is empty",
-                client_ip
+                "Connection from any IP {client_ip} should be allowed when whitelist is empty",
             );
         }
     }

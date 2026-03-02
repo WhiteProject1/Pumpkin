@@ -1,6 +1,5 @@
 use pumpkin_protocol::java::client::play::CommandSuggestion;
 use pumpkin_util::text::TextComponent;
-use pumpkin_util::text::color::NamedColor;
 
 use super::args::ConsumedArgs;
 
@@ -68,7 +67,7 @@ impl CommandRateLimiter {
     }
 
     /// Checks if a player is allowed to execute a command and records the attempt.
-    /// Returns a tuple of (allowed, should_warn).
+    /// Returns a tuple of (allowed, `should_warn`).
     /// Requirements: 7.1, 7.2, 7.3
     pub async fn check_and_record(&self, player_id: &Uuid) -> (bool, bool) {
         let now = Instant::now();
@@ -114,7 +113,7 @@ impl CommandRateLimiter {
     #[cfg(test)]
     pub async fn get_count(&self, player_id: &Uuid) -> u32 {
         let entries = self.entries.read().await;
-        entries.get(player_id).map(|e| e.count).unwrap_or(0)
+        entries.get(player_id).map_or(0, |e| e.count)
     }
 
     /// Resets the rate limiter state for a player (useful for testing).
@@ -174,7 +173,7 @@ impl CommandError {
                     "I'm sorry, but you do not have permission to perform this command. Please contact the server administrator if you believe this is an error.",
                 )
             }
-            CommandError::RateLimited => {
+            Self::RateLimited => {
                 // Silent - we don't send an error message for rate limited commands
                 // The command is simply ignored per Requirements 7.2
                 TextComponent::text("")

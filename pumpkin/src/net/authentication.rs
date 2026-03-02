@@ -228,15 +228,16 @@ pub enum TextureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_config::networking::auth::TextureTypes;
     use proptest::prelude::*;
 
-    /// Helper to create a TextureConfig with specific allowed domains and schemes
+    /// Helper to create a `TextureConfig` with specific allowed domains and schemes
     fn config_with_domains(domains: Vec<String>, schemes: Vec<String>) -> TextureConfig {
         TextureConfig {
             enabled: true,
             allowed_url_schemes: schemes,
             allowed_url_domains: domains,
-            types: Default::default(),
+            types: TextureTypes::default(),
         }
     }
 
@@ -264,8 +265,7 @@ mod tests {
             let result = is_texture_url_valid(&url, &config);
             assert!(
                 result.is_err(),
-                "URL {} should be rejected (suffix match not allowed), but was accepted",
-                url_str
+                "URL {url_str} should be rejected (suffix match not allowed), but was accepted",
             );
         }
 
@@ -302,8 +302,7 @@ mod tests {
                 let result = is_texture_url_valid(&url, &config);
                 assert!(
                     result.is_err(),
-                    "URL {} with suspicious pattern should be rejected",
-                    url_str
+                    "URL {url_str} with suspicious pattern should be rejected",
                 );
             }
             // If URL parsing fails, that's also acceptable (invalid URL)
@@ -319,16 +318,16 @@ mod tests {
             config_with_domains(vec!["minecraft.net".to_string()], vec!["https".to_string()]);
 
         // HTTP should be rejected when only HTTPS is allowed
-        let http_url: Uri = "http://minecraft.net/texture.png".parse().unwrap();
-        let result = is_texture_url_valid(&http_url, &config);
+        let http_only_url: Uri = "http://minecraft.net/texture.png".parse().unwrap();
+        let result = is_texture_url_valid(&http_only_url, &config);
         assert!(
             result.is_err(),
             "HTTP URL should be rejected when only HTTPS is allowed"
         );
 
         // HTTPS should be accepted
-        let https_url: Uri = "https://minecraft.net/texture.png".parse().unwrap();
-        let result = is_texture_url_valid(&https_url, &config);
+        let https_secure_url: Uri = "https://minecraft.net/texture.png".parse().unwrap();
+        let result = is_texture_url_valid(&https_secure_url, &config);
         assert!(
             result.is_ok(),
             "HTTPS URL should be accepted when HTTPS is allowed"
@@ -346,14 +345,14 @@ mod tests {
             allowed_domain in "[a-z]{3,10}\\.[a-z]{2,4}",
         ) {
             // Create a domain that is a subdomain of the allowed domain
-            let malicious_domain = format!("{}.{}", subdomain, allowed_domain);
+            let malicious_domain = format!("{subdomain}.{allowed_domain}");
 
             let config = config_with_domains(
                 vec![allowed_domain.clone()],
                 vec!["https".to_string()],
             );
 
-            let url_str = format!("https://{}/texture.png", malicious_domain);
+            let url_str = format!("https://{malicious_domain}/texture.png");
             if let Ok(url) = url_str.parse::<Uri>() {
                 let result = is_texture_url_valid(&url, &config);
                 // Subdomain should be rejected (not exact match)
@@ -378,7 +377,7 @@ mod tests {
                 vec!["https".to_string()],
             );
 
-            let url_str = format!("https://{}/texture.png", domain);
+            let url_str = format!("https://{domain}/texture.png");
             if let Ok(url) = url_str.parse::<Uri>() {
                 let result = is_texture_url_valid(&url, &config);
                 prop_assert!(
@@ -403,8 +402,8 @@ mod tests {
             );
 
             // Create a domain with percent encoding
-            let malicious_domain = format!("{}%2e{}", prefix, suffix);
-            let url_str = format!("https://{}.net/texture.png", malicious_domain);
+            let malicious_domain = format!("{prefix}%2e{suffix}");
+            let url_str = format!("https://{malicious_domain}.net/texture.png");
 
             if let Ok(url) = url_str.parse::<Uri>() {
                 let result = is_texture_url_valid(&url, &config);

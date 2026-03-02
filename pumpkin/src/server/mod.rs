@@ -68,7 +68,8 @@ pub struct PendingLogin {
 }
 
 impl PendingLogin {
-    /// Creates a new PendingLogin with the given verification token
+    /// Creates a new `PendingLogin` with the given verification token
+    #[must_use]
     pub fn new(verification_token: [u8; 4]) -> Self {
         Self {
             verification_token,
@@ -76,7 +77,8 @@ impl PendingLogin {
         }
     }
 
-    /// Checks if this pending login has expired (older than VERIFICATION_TOKEN_TIMEOUT_SECS)
+    /// Checks if this pending login has expired (older than `VERIFICATION_TOKEN_TIMEOUT_SECS`)
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed() > Duration::from_secs(VERIFICATION_TOKEN_TIMEOUT_SECS)
     }
@@ -137,7 +139,7 @@ pub struct Server {
     // TODO: Make this a trait
     _locker: Arc<Option<AnvilLevelLocker>>,
     /// Stores pending login verification tokens for encryption handshake validation
-    /// Key: client ID, Value: PendingLogin with verification token and creation time
+    /// Key: client ID, Value: `PendingLogin` with verification token and creation time
     /// Requirements: 5.1
     pub pending_logins: RwLock<HashMap<u64, PendingLogin>>,
 }
@@ -683,7 +685,7 @@ impl Server {
         pending_logins.remove(&client_id)
     }
 
-    /// Cleans up expired pending logins (older than VERIFICATION_TOKEN_TIMEOUT_SECS).
+    /// Cleans up expired pending logins (older than `VERIFICATION_TOKEN_TIMEOUT_SECS`).
     /// Should be called periodically to prevent memory leaks.
     /// Requirements: 5.4
     pub async fn cleanup_expired_pending_logins(&self) {
@@ -924,7 +926,6 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration as StdDuration;
 
     /// Property test: For any encryption response, the decrypted verification token SHALL match
     /// the originally sent token.
@@ -970,7 +971,7 @@ mod tests {
         }
     }
 
-    /// Property test: Pending logins older than VERIFICATION_TOKEN_TIMEOUT_SECS SHALL be expired.
+    /// Property test: Pending logins older than `VERIFICATION_TOKEN_TIMEOUT_SECS` SHALL be expired.
     /// **Feature: security-hardening, Property 6: Verification Token Match**
     /// **Validates: Requirements 5.4**
     #[test]
@@ -991,7 +992,7 @@ mod tests {
         );
     }
 
-    /// Test that PendingLogin correctly tracks creation time.
+    /// Test that `PendingLogin` correctly tracks creation time.
     /// **Feature: security-hardening, Property 6: Verification Token Match**
     /// **Validates: Requirements 5.1**
     #[test]
@@ -1009,7 +1010,7 @@ mod tests {
         assert!(pending.created_at <= after);
     }
 
-    /// Test HashMap operations for pending_logins storage.
+    /// Test `HashMap` operations for `pending_logins` storage.
     /// **Feature: security-hardening, Property 6: Verification Token Match**
     /// **Validates: Requirements 5.1**
     #[tokio::test]
@@ -1019,29 +1020,26 @@ mod tests {
         // Store a pending login
         let client_id: u64 = 12345;
         let token: [u8; 4] = rand::random();
-        {
-            let mut logins = pending_logins.write().await;
-            logins.insert(client_id, PendingLogin::new(token));
-        }
+        let mut logins = pending_logins.write().await;
+        logins.insert(client_id, PendingLogin::new(token));
+        drop(logins);
 
         // Retrieve and verify
-        {
-            let logins = pending_logins.read().await;
-            let pending = logins.get(&client_id);
-            assert!(pending.is_some(), "Pending login should exist");
-            assert_eq!(
-                pending.unwrap().verification_token,
-                token,
-                "Token should match"
-            );
-        }
+        let logins = pending_logins.read().await;
+        let pending = logins.get(&client_id);
+        assert!(pending.is_some(), "Pending login should exist");
+        assert_eq!(
+            pending.unwrap().verification_token,
+            token,
+            "Token should match"
+        );
+        drop(logins);
 
         // Remove and verify it's gone
-        {
-            let mut logins = pending_logins.write().await;
-            let removed = logins.remove(&client_id);
-            assert!(removed.is_some(), "Should be able to remove pending login");
-        }
+        let mut logins = pending_logins.write().await;
+        let removed = logins.remove(&client_id);
+        assert!(removed.is_some(), "Should be able to remove pending login");
+        drop(logins);
 
         {
             let logins = pending_logins.read().await;

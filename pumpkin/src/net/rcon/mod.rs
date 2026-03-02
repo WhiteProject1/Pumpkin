@@ -62,8 +62,7 @@ impl RCONServer {
             // Reject new connections when max_connections limit is reached
             if config.max_connections != 0 && connections >= config.max_connections {
                 log::warn!(
-                    "RCON: Rejected connection from {} - max connections reached",
-                    address
+                    "RCON: Rejected connection from {address} - max connections reached",
                 );
                 drop(connection);
                 continue;

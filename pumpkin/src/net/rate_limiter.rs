@@ -1,4 +1,4 @@
-//! Rate limiting module for protecting against brute force and DoS attacks.
+//! Rate limiting module for protecting against brute force and `DoS` attacks.
 //!
 //! Provides a generic rate limiter that can be used for:
 //! - RCON authentication attempts
@@ -108,10 +108,10 @@ impl RateLimiter {
     /// Checks if an IP is currently blocked.
     pub async fn is_blocked(&self, ip: &IpAddr) -> bool {
         let blocked = self.blocked.read().await;
-        if let Some(unblock_time) = blocked.get(ip) {
-            if Instant::now() < *unblock_time {
-                return true;
-            }
+        if let Some(unblock_time) = blocked.get(ip)
+            && Instant::now() < *unblock_time
+        {
+            return true;
         }
         false
     }
@@ -135,10 +135,9 @@ impl RateLimiter {
         let now = Instant::now();
 
         // Cleanup expired request entries
-        {
-            let mut requests = self.requests.write().await;
-            requests.retain(|_, entry| now.duration_since(entry.window_start) < self.window * 2);
-        }
+        let mut requests = self.requests.write().await;
+        requests.retain(|_, entry| now.duration_since(entry.window_start) < self.window * 2);
+        drop(requests);
 
         // Cleanup expired blocks
         {
@@ -157,7 +156,7 @@ impl RateLimiter {
     /// Gets the current request count for an IP (useful for testing/monitoring).
     pub async fn get_count(&self, ip: &IpAddr) -> u32 {
         let requests = self.requests.read().await;
-        requests.get(ip).map(|e| e.count).unwrap_or(0)
+        requests.get(ip).map_or(0, |e| e.count)
     }
 }
 
@@ -232,7 +231,7 @@ mod tests {
         assert_eq!(limiter.get_count(&ip).await, 0);
     }
 
-    /// Property test: For any IP that exceeds max_requests, it should be blocked
+    /// Property test: For any IP that exceeds `max_requests`, it should be blocked
     /// **Feature: security-hardening, Property 2: RCON Rate Limiting**
     /// **Validates: Requirements 2.3, 2.5**
     #[tokio::test]
@@ -257,8 +256,7 @@ mod tests {
             // IP should now be blocked
             assert!(
                 limiter.is_blocked(&ip).await,
-                "IP should be blocked after {} requests",
-                max_requests
+                "IP should be blocked after {max_requests} requests",
             );
             assert!(
                 !limiter.check(&ip).await,
@@ -309,8 +307,7 @@ mod tests {
         for i in 0..(max_requests - 1) {
             assert!(
                 limiter.check(&ip).await,
-                "Request {} should be allowed (under limit)",
-                i
+                "Request {i} should be allowed (under limit)",
             );
             limiter.record(&ip).await;
         }
@@ -349,8 +346,7 @@ mod tests {
             for i in 0..max_connections_per_second {
                 assert!(
                     limiter.check(&ip).await,
-                    "Connection {} should be allowed (under limit)",
-                    i
+                    "Connection {i} should be allowed (under limit)",
                 );
                 limiter.record(&ip).await;
             }

@@ -94,8 +94,7 @@ mod tests {
 
             assert!(
                 key_bits >= 2048,
-                "RSA key length should be at least 2048 bits, but got {} bits",
-                key_bits
+                "RSA key length should be at least 2048 bits, but got {key_bits} bits",
             );
         }
     }
@@ -108,8 +107,7 @@ mod tests {
         let key_bits = keystore.private_key.n().bits();
         assert!(
             key_bits >= 2048,
-            "KeyStore private key should be at least 2048 bits, got {} bits",
-            key_bits
+            "KeyStore private key should be at least 2048 bits, got {key_bits} bits",
         );
 
         // Verify public key DER is not empty
