@@ -244,7 +244,11 @@ impl ChunkManager {
 
     pub fn handle_acknowledge(&mut self, chunks_per_tick: f32) {
         self.batches_sent_since_ack = BatchState::Count(0);
-        self.chunks_per_tick = chunks_per_tick.ceil() as usize;
+        self.chunks_per_tick = if chunks_per_tick.is_finite() {
+            (chunks_per_tick.ceil() as usize).clamp(1, 64)
+        } else {
+            16
+        };
     }
 
     pub fn push_chunk(&mut self, position: Vector2<i32>, chunk: SyncChunk) {
@@ -386,6 +390,10 @@ pub struct Player {
     pub experience_pick_up_delay: Mutex<u32>,
     pub chunk_manager: Mutex<ChunkManager>,
     pub has_played_before: AtomicBool,
+    /// Anti-spam: message count in current rate-limit window.
+    pub chat_spam_count: AtomicU32,
+    /// Anti-spam: start of the current rate-limit window.
+    pub chat_spam_window_start: AtomicCell<Instant>,
     pub chat_session: Arc<Mutex<ChatSession>>,
     pub signature_cache: Mutex<MessageCache>,
     pub player_screen_handler: Arc<Mutex<PlayerScreenHandler>>,
@@ -489,6 +497,8 @@ impl Player {
             last_sent_food: AtomicU8::new(0),
             last_food_saturation: AtomicBool::new(true),
             has_played_before: AtomicBool::new(false),
+            chat_spam_count: AtomicU32::new(0),
+            chat_spam_window_start: AtomicCell::new(std::time::Instant::now()),
             chat_session: Arc::new(Mutex::new(ChatSession::default())), // Placeholder value until the player actually sets their session id
             signature_cache: Mutex::new(MessageCache::default()),
             player_screen_handler: player_screen_handler.clone(),
@@ -559,10 +569,55 @@ impl Player {
         //self.world().level.list_cached();
     }
 
+    /// Check chat spam: returns true if message is allowed, false if rate-limited.
+    /// Vanilla allows ~10 messages per 10 seconds before kicking.
+    #[must_use]
+    pub fn check_chat_spam(&self) -> bool {
+        let now = std::time::Instant::now();
+        let window_start = self.chat_spam_window_start.load();
+        if now.duration_since(window_start) >= std::time::Duration::from_secs(10) {
+            self.chat_spam_window_start.store(now);
+            self.chat_spam_count.store(1, Ordering::Relaxed);
+            true
+        } else {
+            let count = self.chat_spam_count.fetch_add(1, Ordering::Relaxed) + 1;
+            count <= 10
+        }
+    }
+
+    /// Maximum entity interaction range (vanilla: 3.0 survival, 6.0 creative).
+    #[must_use]
+    pub fn entity_interaction_range(&self) -> f64 {
+        if self.gamemode.load() == GameMode::Creative {
+            6.0
+        } else {
+            3.0
+        }
+    }
+
+    /// Check whether a target entity is within interaction reach.
+    #[must_use]
+    pub fn can_interact_with_entity(&self, target: &Entity) -> bool {
+        let range = self.entity_interaction_range();
+        let buffer = 1.0;
+        let max_dist = range + buffer;
+        let my_pos = self.living_entity.entity.pos.load();
+        let target_pos = target.pos.load();
+        let dx = my_pos.x - target_pos.x;
+        let dy = my_pos.y - target_pos.y;
+        let dz = my_pos.z - target_pos.z;
+        (dx * dx + dy * dy + dz * dz) < max_dist * max_dist
+    }
+
     pub async fn attack(&self, victim: Arc<dyn EntityBase>) {
         let world = self.world();
         let server = world.server.upgrade().unwrap();
         let victim_entity = victim.get_entity();
+
+        // Range validation: reject attacks beyond reach distance
+        if !self.can_interact_with_entity(victim_entity) {
+            return;
+        }
         let attacker_entity = &self.living_entity.entity;
         let config = &server.advanced_config.pvp;
 

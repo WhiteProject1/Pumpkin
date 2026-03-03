@@ -48,9 +48,7 @@ pub async fn bungeecord_login(
 
     // IP whitelist validation
     if !config.allowed_ips.is_empty() && !config.allowed_ips.contains(&client_ip) {
-        log::warn!(
-            "BungeeCord connection rejected from non-whitelisted IP: {client_ip}",
-        );
+        log::warn!("BungeeCord connection rejected from non-whitelisted IP: {client_ip}",);
         return Err(BungeeCordError::ProxyNotAllowed);
     }
 

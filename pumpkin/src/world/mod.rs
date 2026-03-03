@@ -2313,6 +2313,11 @@ impl World {
         }
     }
 
+    /// Returns the current number of non-player entities in this world.
+    pub async fn get_entity_count(&self) -> usize {
+        self.entities.read().await.len()
+    }
+
     /// Adds an entity to the world.
     pub async fn spawn_entity(&self, entity: Arc<dyn EntityBase>) {
         let base_entity = entity.get_entity();

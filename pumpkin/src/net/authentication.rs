@@ -228,8 +228,8 @@ pub enum TextureError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pumpkin_config::networking::auth::TextureTypes;
     use proptest::prelude::*;
+    use pumpkin_config::networking::auth::TextureTypes;
 
     /// Helper to create a `TextureConfig` with specific allowed domains and schemes
     fn config_with_domains(domains: Vec<String>, schemes: Vec<String>) -> TextureConfig {

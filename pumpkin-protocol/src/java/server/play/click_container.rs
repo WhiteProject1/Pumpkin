@@ -48,7 +48,11 @@ impl<'de> Deserialize<'de> for SClickSlot {
                 let length_of_array = seq
                     .next_element::<VarInt>()?
                     .ok_or(de::Error::custom("Failed to decode VarInt"))?;
-                let mut array_of_changed_slots = vec![];
+                // Cap at 128 to prevent excessive allocation (vanilla max is 46 slots)
+                if length_of_array.0 < 0 || length_of_array.0 > 128 {
+                    return Err(de::Error::custom("Invalid changed slots length"));
+                }
+                let mut array_of_changed_slots = Vec::with_capacity(length_of_array.0 as usize);
                 for _ in 0..length_of_array.0 {
                     let slot_number = seq
                         .next_element::<i16>()?

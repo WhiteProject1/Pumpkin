@@ -526,6 +526,17 @@ impl JavaClient {
         server: &Arc<Server>,
         command: &SChatCommand,
     ) {
+        // Validate command length (vanilla max: 256 characters)
+        if command.command.len() > 256 {
+            return;
+        }
+
+        // Rate limit: shared with chat messages
+        if !player.check_chat_spam() {
+            self.kick(TextComponent::text("Kicked for spamming")).await;
+            return;
+        }
+
         let player_clone = player.clone();
         let server_clone = server.clone();
         send_cancellable! {{
@@ -748,6 +759,12 @@ impl JavaClient {
         player: &Arc<Player>,
         chat_message: SChatMessage,
     ) {
+        // Rate limit: max 10 messages per 10 seconds
+        if !player.check_chat_spam() {
+            self.kick(TextComponent::text("Kicked for spamming")).await;
+            return;
+        }
+
         let gameprofile = &player.gameprofile;
 
         if let Err(err) = self
@@ -1113,6 +1130,10 @@ impl JavaClient {
                     return;
                 }
                 if let Some(player_victim) = player_victim {
+                    // Range validation: reject attacks beyond reach distance
+                    if !player.can_interact_with_entity(&player_victim.living_entity.entity) {
+                        return;
+                    }
                     if player_victim.living_entity.health.load() <= 0.0 {
                         // You can trigger this from a non-modded / innocent client,
                         // so we shouldn't kick the player.
@@ -1132,6 +1153,10 @@ impl JavaClient {
                     }
                     player.attack(player_victim).await;
                 } else if let Some(entity_victim) = world.get_entity_by_id(entity_id.0).await {
+                    // Range validation for non-player entities
+                    if !player.can_interact_with_entity(entity_victim.get_entity()) {
+                        return;
+                    }
                     player.attack(entity_victim).await;
                 } else {
                     log::error!(
@@ -1150,6 +1175,10 @@ impl JavaClient {
                 // TODO: split this up
                 let entity = player.world().get_player_by_id(entity_id.0).await;
                 if let Some(entity) = entity {
+                    // Range validation: reject interactions beyond reach distance
+                    if !player.can_interact_with_entity(&entity.living_entity.entity) {
+                        return;
+                    }
                     let held = player.inventory.held_item();
                     let mut stack = held.lock().await;
                     server
@@ -1528,6 +1557,11 @@ impl JavaClient {
     }
 
     pub async fn handle_sign_update(&self, player: &Player, sign_data: SUpdateSign) {
+        // Proximity check: player must be near the sign
+        if !player.can_interact_with_block_at(&sign_data.location, 1.0) {
+            return;
+        }
+
         let world = &player.living_entity.entity.world;
         let Some(block_entity) = world.get_block_entity(&sign_data.location).await else {
             return;
@@ -1539,6 +1573,19 @@ impl JavaClient {
             return;
         }
 
+        // Authorization check: only the player who opened the sign can edit it
+        let editing_player = *sign_entity.currently_editing_player.lock().await;
+        if editing_player != Some(player.gameprofile.id) {
+            return;
+        }
+
+        // Filter illegal characters from sign lines (same as chat validation)
+        let filter_sign_line = |line: String| -> String {
+            line.chars()
+                .filter(|&c| c != '§' && c >= ' ' && c != '\x7F')
+                .collect()
+        };
+
         let text = if sign_data.is_front_text {
             &sign_entity.front_text
         } else {
@@ -1546,10 +1593,10 @@ impl JavaClient {
         };
 
         *text.messages.lock().unwrap() = [
-            sign_data.line_1,
-            sign_data.line_2,
-            sign_data.line_3,
-            sign_data.line_4,
+            filter_sign_line(sign_data.line_1),
+            filter_sign_line(sign_data.line_2),
+            filter_sign_line(sign_data.line_3),
+            filter_sign_line(sign_data.line_4),
         ];
         *sign_entity.currently_editing_player.lock().await = None;
         world.update_block_entity(&block_entity).await;
