@@ -41,6 +41,14 @@ pub fn proto_to_data_sound(id_or: &crate::IdOr<crate::SoundEvent>) -> Option<IdO
     }
 }
 
+/// How much to reserve up front for a client-declared element count. The count is only a claim
+/// until the elements have been read, and a few bytes can declare billions of them, so the rest
+/// of the capacity is grown as they arrive.
+fn prealloc(len: usize) -> usize {
+    const MAX_PREALLOC: usize = 1024;
+    len.min(MAX_PREALLOC)
+}
+
 fn deserialize_idset<T: IDSetContent>(
     seq: &mut impl NetworkReadExt,
 ) -> Result<IDSet<T>, ReadingError> {
@@ -53,7 +61,7 @@ fn deserialize_idset<T: IDSetContent>(
         }
         std::cmp::Ordering::Greater => {
             let len = id_type - 1;
-            let mut content_vec = Vec::with_capacity(len as usize);
+            let mut content_vec = Vec::with_capacity(prealloc(len as usize));
 
             for _ in 0..len {
                 let varint_id = seq.get_var_int()?.0;
@@ -1661,22 +1669,22 @@ impl DataComponentCodec<Self> for CustomModelDataImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let floats_len = seq.get_var_int()?.0 as usize;
-        let mut floats = Vec::with_capacity(floats_len);
+        let mut floats = Vec::with_capacity(prealloc(floats_len));
         for _ in 0..floats_len {
             floats.push(seq.get_f32()?);
         }
         let flags_len = seq.get_var_int()?.0 as usize;
-        let mut flags = Vec::with_capacity(flags_len);
+        let mut flags = Vec::with_capacity(prealloc(flags_len));
         for _ in 0..flags_len {
             flags.push(seq.get_bool()?);
         }
         let strings_len = seq.get_var_int()?.0 as usize;
-        let mut strings = Vec::with_capacity(strings_len);
+        let mut strings = Vec::with_capacity(prealloc(strings_len));
         for _ in 0..strings_len {
             strings.push(seq.get_str()?.to_string());
         }
         let colors_len = seq.get_var_int()?.0 as usize;
-        let mut colors = Vec::with_capacity(colors_len);
+        let mut colors = Vec::with_capacity(prealloc(colors_len));
         for _ in 0..colors_len {
             colors.push(seq.get_i32()?);
         }
@@ -1803,7 +1811,7 @@ impl DataComponentCodec<Self> for ToolImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let rules_len = seq.get_var_int()?.0 as usize;
-        let mut rules = Vec::with_capacity(rules_len);
+        let mut rules = Vec::with_capacity(prealloc(rules_len));
         for _ in 0..rules_len {
             let blocks = deserialize_idset(seq)?;
             let speed = if seq.get_bool()? {
@@ -2226,7 +2234,7 @@ impl DataComponentCodec<Self> for ChargedProjectilesImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let len = seq.get_var_int()?.0 as usize;
-        let mut projectiles = Vec::with_capacity(len);
+        let mut projectiles = Vec::with_capacity(prealloc(len));
         for _ in 0..len {
             let _ = deserialize_item_stack_template(seq)?;
             projectiles.push(pumpkin_nbt::compound::NbtCompound::new());
@@ -2258,7 +2266,7 @@ impl DataComponentCodec<Self> for WritableBookContentImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let len = seq.get_var_int()?.0 as usize;
-        let mut pages = Vec::with_capacity(len);
+        let mut pages = Vec::with_capacity(prealloc(len));
         for _ in 0..len {
             let raw = seq.get_str()?.to_string();
             let has_filtered = seq.get_bool()?;
@@ -2293,7 +2301,7 @@ impl DataComponentCodec<Self> for WrittenBookContentImpl {
         let author = seq.get_str()?.to_string();
         let _generation = seq.get_var_int()?.0;
         let pages_len = seq.get_var_int()?.0 as usize;
-        let mut pages = Vec::with_capacity(pages_len);
+        let mut pages = Vec::with_capacity(prealloc(pages_len));
         for _ in 0..pages_len {
             let tag = seq.get_nbt_with_version(&JavaMinecraftVersion::V_26_2)?;
             let comp = tag.as_ref().map_or_else(
@@ -2666,7 +2674,7 @@ impl DataComponentCodec<Self> for BannerPatternsImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let len = seq.get_var_int()?.0 as usize;
-        let mut layers = Vec::with_capacity(len);
+        let mut layers = Vec::with_capacity(prealloc(len));
         for _ in 0..len {
             let _pattern = seq.get_var_int()?.0;
             let color_id = seq.get_var_int()?.0 as u8;
@@ -2722,7 +2730,7 @@ impl DataComponentCodec<Self> for ContainerImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let len = seq.get_var_int()?.0 as usize;
-        let mut items = Vec::with_capacity(len);
+        let mut items = Vec::with_capacity(prealloc(len));
         for slot in 0..len {
             if seq.get_bool()? {
                 let stack = deserialize_item_stack_template(seq)?;
@@ -2745,7 +2753,7 @@ impl DataComponentCodec<Self> for BlockStateImpl {
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let len = seq.get_var_int()?.0 as usize;
-        let mut properties = Vec::with_capacity(len);
+        let mut properties = Vec::with_capacity(prealloc(len));
         for _ in 0..len {
             let k = seq.get_str()?.to_string();
             let v = seq.get_str()?.to_string();
