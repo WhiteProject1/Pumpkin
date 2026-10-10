@@ -1,5 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use std::net::SocketAddr;
 
 impl PendingConnection {
     pub async fn handle_login_start(
@@ -50,7 +51,11 @@ impl PendingConnection {
                     login_start.name.into_string(),
                     &proxy.bungeecord.secret,
                 ) {
-                    Ok((_ip, profile)) => {
+                    Ok((ip, profile)) => {
+                        // The proxy carries the player's own address, and the velocity and vine
+                        // paths already take it. Without it every check past here, bans included,
+                        // sees the proxy instead.
+                        self.address = SocketAddr::new(ip, self.address.port());
                         self.gameprofile = Some(profile.clone());
                         self.finish_login(server, &profile).await
                     }
