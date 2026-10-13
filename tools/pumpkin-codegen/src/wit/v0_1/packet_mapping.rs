@@ -190,6 +190,15 @@ enum MappingMode {
     Downcast,
 }
 
+/// A client can send values the WIT type cannot hold; such a packet is dropped, not panicked on.
+const fn try_into_value(mode: MappingMode) -> &'static str {
+    if matches!(mode, MappingMode::Deserialize) {
+        ".try_into().ok()?"
+    } else {
+        ".try_into().unwrap()"
+    }
+}
+
 fn has_attr(attrs: &[Attribute], attr_name: &str) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident(attr_name))
 }
@@ -300,7 +309,7 @@ fn convert_value(
                 )
             }
             MappingMode::Deserialize | MappingMode::ToWit => {
-                format!("{}.0.try_into().unwrap()", src)
+                format!("{}.0{}", src, try_into_value(mode))
             }
             MappingMode::Downcast => String::new(),
         },
@@ -339,7 +348,7 @@ fn convert_value(
                 if is_slice {
                     format!("{}.iter().map(|v| v.0 as _).collect()", src)
                 } else {
-                    format!("{}.0.try_into().unwrap()", src)
+                    format!("{}.0{}", src, try_into_value(mode))
                 }
             } else {
                 // ToWit
@@ -527,9 +536,9 @@ fn convert_value(
                         format!("{}.iter().map(|v| *v as _).collect()", src)
                     }
                 } else if type_ident == "VarInt" {
-                    format!("{}.0.try_into().unwrap()", src)
+                    format!("{}.0{}", src, try_into_value(mode))
                 } else {
-                    format!("{}.try_into().unwrap()", src)
+                    format!("{}{}", src, try_into_value(mode))
                 }
             }
             MappingMode::Downcast => String::new(),
