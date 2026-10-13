@@ -38,6 +38,12 @@ impl JavaClient {
             ));
             return;
         };
+        // Vanilla checks the same reach before dispatching the interaction, with 3.0 blocks of
+        // slack for the client's own view of where things are.
+        if !player.can_interact_with_entity(&target.get_entity().bounding_box.load(), 3.0) {
+            return;
+        }
+
         if let Some(player_victim) = &player_target {
             if player_victim.living_entity.health.load() <= 0.0 {
                 return;

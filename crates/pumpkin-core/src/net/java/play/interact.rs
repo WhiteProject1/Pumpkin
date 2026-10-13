@@ -39,6 +39,12 @@ impl JavaClient {
                 player.try_send_client_packet(&CSetCamera::new(entity_id));
                 return;
             }
+
+            // Vanilla checks the same reach before dispatching the interaction, with 3.0 blocks of
+            // slack for the client's own view of where things are.
+            if !player.can_interact_with_entity(&target.get_entity().bounding_box.load(), 3.0) {
+                return;
+            }
             send_cancellable_blocking! {{
                 server;
                 PlayerInteractEntityEvent::new(

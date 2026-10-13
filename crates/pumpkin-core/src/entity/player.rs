@@ -4237,6 +4237,28 @@ impl Player {
         }
     }
 
+    pub fn entity_interaction_range(&self) -> f64 {
+        self.living_entity
+            .get_attribute_value(&Attributes::ENTITY_INTERACTION_RANGE)
+    }
+
+    /// Whether the player can reach an entity, measured from the eye to the nearest point of its
+    /// box. `additional_range` is the slack vanilla allows the client, 3.0 for interactions.
+    pub fn can_interact_with_entity(
+        &self,
+        bounding_box: &BoundingBox,
+        additional_range: f64,
+    ) -> bool {
+        let d = self.entity_interaction_range() + additional_range;
+        let entity_pos = self.living_entity.entity.pos.load();
+        let eye_height = self.living_entity.entity.get_eye_height();
+        bounding_box.squared_magnitude(Vector3 {
+            x: entity_pos.x,
+            y: entity_pos.y + eye_height,
+            z: entity_pos.z,
+        }) < d * d
+    }
+
     pub fn can_interact_with_block_at(&self, position: &BlockPos, additional_range: f64) -> bool {
         let d = self.block_interaction_range() + additional_range;
         let box_pos = BoundingBox::from_block(position);
