@@ -81,6 +81,8 @@ pub struct PendingConnection {
     /// Whether `CLoginSuccess` has been sent, mirroring vanilla's
     /// `State::PROTOCOL_SWITCHING`. Login acknowledgement is only valid after it.
     pub login_success_sent: bool,
+    /// Whether the status was already sent. One request per connection, as vanilla does.
+    pub status_requested: bool,
     /// For the connection packet events.
     server: Weak<Server>,
 }
@@ -110,6 +112,7 @@ impl PendingConnection {
             packet_limiter,
             login_started: false,
             login_success_sent: false,
+            status_requested: false,
             verify_token: None,
             vine_challenge: None,
             server,
@@ -396,6 +399,12 @@ impl PendingConnection {
 
         match packet.id {
             id if id == pumpkin_protocol::java::server::status::SStatusRequest::to_id(version) => {
+                if self.status_requested {
+                    self.close();
+                    return Ok(Some(PacketHandlerResult::Stop));
+                }
+
+                self.status_requested = true;
                 self.handle_status_request(server).await;
                 Ok(None)
             }
