@@ -593,6 +593,10 @@ impl PumpkinServer {
                                      pending.close();
                                 },
                                 PacketHandlerResult::ReadyToPlay(profile, config) => {
+                                     // Kicked while finishing config: don't add a ghost player.
+                                     if pending.is_closed() {
+                                         return;
+                                     }
                                      let mut java_client = JavaClient::from_pending(pending, profile.clone(), config.clone());
                                      java_client.start_outgoing_packet_task();
 

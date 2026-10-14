@@ -81,6 +81,9 @@ pub struct PendingConnection {
     /// Whether `CLoginSuccess` has been sent, mirroring vanilla's
     /// `State::PROTOCOL_SWITCHING`. Login acknowledgement is only valid after it.
     pub login_success_sent: bool,
+    /// Whether `CFinishConfig` has been sent. Gates the config acknowledgement
+    /// and rejects a second `SKnownPacks`.
+    pub finish_config_sent: bool,
     /// For the connection packet events.
     server: Weak<Server>,
 }
@@ -110,6 +113,7 @@ impl PendingConnection {
             packet_limiter,
             login_started: false,
             login_success_sent: false,
+            finish_config_sent: false,
             verify_token: None,
             vine_challenge: None,
             server,
@@ -156,6 +160,8 @@ impl PendingConnection {
     pub async fn get_packet(&mut self) -> Option<RawPacket> {
         let close_token = self.close_token.clone();
         let packet_result = tokio::select! {
+            // After a kick, a packet pipelined behind the bad one must lose.
+            biased;
             () = close_token.cancelled() => {
                 debug!("Canceling pending connection packet processing");
                 return None;
@@ -196,6 +202,9 @@ impl PendingConnection {
 
     /// Encoded as 26.3. `ConnectionPacketSentEvent` can rewrite it.
     pub async fn send_packet_now<P: ClientPacket>(&mut self, packet: &P) {
+        if self.is_closed() {
+            return;
+        }
         let mut packet_buf = Vec::new();
         if let Err(err) =
             JavaClient::write_packet_for_version(packet, CURRENT_MC_VERSION, &mut packet_buf)
@@ -322,6 +331,10 @@ impl PendingConnection {
 
             match self.handle_packet(server, &packet).await {
                 Ok(result) => {
+                    // Nothing after a kick may finish the login.
+                    if self.is_closed() {
+                        return PacketHandlerResult::Stop;
+                    }
                     if let Some(result) = result {
                         return result;
                     }
@@ -333,6 +346,7 @@ impl PendingConnection {
                         packet.id, error
                     );
                     self.kick(TextComponent::text(text)).await;
+                    return PacketHandlerResult::Stop;
                 }
             }
         }
@@ -512,6 +526,15 @@ impl PendingConnection {
                 Ok(None)
             }
             id if id == SAcknowledgeFinishConfig::to_id(version) => {
+                // Only valid once we asked for it, else the client skips the
+                // registry sync and a forced resource pack.
+                if !self.finish_config_sent {
+                    self.kick(TextComponent::text(
+                        "Unexpected configuration acknowledgement",
+                    ))
+                    .await;
+                    return Ok(Some(PacketHandlerResult::Stop));
+                }
                 let Some(profile) = self.gameprofile.clone() else {
                     return Ok(Some(PacketHandlerResult::Stop));
                 };
@@ -525,6 +548,12 @@ impl PendingConnection {
                 }
             }
             id if id == SKnownPacks::to_id(version) => {
+                // The registry sync is expensive and only needed once.
+                if self.finish_config_sent {
+                    self.kick(TextComponent::text("Unexpected known packs"))
+                        .await;
+                    return Ok(Some(PacketHandlerResult::Stop));
+                }
                 self.handle_known_packs(server).await;
                 Ok(None)
             }
