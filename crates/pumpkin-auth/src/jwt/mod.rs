@@ -458,16 +458,34 @@ fn verify_oidc_claims(payload: &Value, expected_issuer: Option<&str>) -> Result<
         )));
     }
 
-    let exp = payload
-        .get("exp")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| AuthError::PublicKeyBuild("OIDC payload missing exp".into()))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| AuthError::PublicKeyBuild("Clock before UNIX epoch".into()))?
         .as_secs();
+    verify_oidc_time_claims(payload, now)
+}
+
+/// Clock skew tolerated between the token issuer and this server for `nbf`.
+const NBF_LEEWAY_SECS: u64 = 60;
+
+/// Checks the `exp` and `nbf` claims against `now`, in seconds since the UNIX epoch.
+fn verify_oidc_time_claims(payload: &Value, now: u64) -> Result<(), AuthError> {
+    let exp = payload
+        .get("exp")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AuthError::PublicKeyBuild("OIDC payload missing exp".into()))?;
     if now > exp {
         return Err(AuthError::PublicKeyBuild("OIDC token expired".into()));
+    }
+
+    // `nbf` says when the token becomes valid; the leeway absorbs issuer clock skew.
+    if let Some(nbf) = payload.get("nbf") {
+        let nbf = nbf
+            .as_u64()
+            .ok_or_else(|| AuthError::PublicKeyBuild("OIDC payload has an invalid nbf".into()))?;
+        if nbf > now.saturating_add(NBF_LEEWAY_SECS) {
+            return Err(AuthError::PublicKeyBuild("OIDC token not yet valid".into()));
+        }
     }
 
     Ok(())
@@ -547,4 +565,39 @@ pub fn extract_cpk_from_token(token: &str) -> Result<PublicKey, AuthError> {
         .ok_or_else(|| AuthError::PublicKeyBuild("OIDC payload missing cpk".into()))?;
 
     build_public_key_from_b64(cpk_b64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn tokens_before_their_nbf_are_rejected() {
+        let payload = json!({ "exp": NOW + 3600, "nbf": NOW + NBF_LEEWAY_SECS + 1 });
+        assert!(verify_oidc_time_claims(&payload, NOW).is_err());
+    }
+
+    #[test]
+    fn nbf_within_the_leeway_is_accepted() {
+        let payload = json!({ "exp": NOW + 3600, "nbf": NOW + NBF_LEEWAY_SECS });
+        assert!(verify_oidc_time_claims(&payload, NOW).is_ok());
+        let payload = json!({ "exp": NOW + 3600, "nbf": NOW - 10 });
+        assert!(verify_oidc_time_claims(&payload, NOW).is_ok());
+    }
+
+    #[test]
+    fn nbf_is_optional_but_must_be_a_number() {
+        assert!(verify_oidc_time_claims(&json!({ "exp": NOW + 3600 }), NOW).is_ok());
+        let payload = json!({ "exp": NOW + 3600, "nbf": "soon" });
+        assert!(verify_oidc_time_claims(&payload, NOW).is_err());
+    }
+
+    #[test]
+    fn expired_tokens_are_still_rejected() {
+        assert!(verify_oidc_time_claims(&json!({ "exp": NOW - 1 }), NOW).is_err());
+        assert!(verify_oidc_time_claims(&json!({}), NOW).is_err());
+    }
 }
