@@ -16,19 +16,81 @@ use std::io::Cursor;
 #[derive(Clone)]
 pub struct ItemStackSerializer<'a>(pub Cow<'a, ItemStack>);
 
-fn item_component_counts(stack: &ItemStack) -> (u8, u8) {
-    let mut to_add = 0u8;
-    let mut to_remove = 0u8;
+/// Vanilla's `ItemStack` codec only accepts counts in `1..=99`.
+const MAX_ITEM_COUNT: i32 = 99;
+/// Component ids are `u8`s and may not repeat in a patch, so no valid patch is larger.
+const MAX_COMPONENTS: i32 = 255;
 
-    for (_, data) in &stack.patch {
-        if data.is_none() {
-            to_remove += 1;
-        } else {
-            to_add += 1;
-        }
+/// How many entries of a stack's patch add a component and how many remove one.
+fn patch_counts(stack: &ItemStack) -> (usize, usize) {
+    let to_remove = stack
+        .patch
+        .iter()
+        .filter(|(_, data)| data.is_none())
+        .count();
+    (stack.patch.len() - to_remove, to_remove)
+}
+
+/// The patch's `to_add`/`to_remove` counts as written on the wire (may exceed a `u8`).
+pub(crate) fn item_component_counts(stack: &ItemStack) -> Result<(VarInt, VarInt), WritingError> {
+    let (to_add, to_remove) = patch_counts(stack);
+    let to_var_int = |count: usize| {
+        VarInt::try_from(count)
+            .map_err(|_| WritingError::Message("Too many item stack components".into()))
+    };
+    Ok((to_var_int(to_add)?, to_var_int(to_remove)?))
+}
+
+/// Checks a count a client sent for a stack that it claims is not empty.
+pub(crate) fn validate_item_count(count: i32) -> Result<u8, ReadingError> {
+    u8::try_from(count)
+        .ok()
+        .filter(|_| (1..=MAX_ITEM_COUNT).contains(&count))
+        .ok_or_else(|| {
+            ReadingError::Message(format!(
+                "Item count {count} is out of bounds (1-{MAX_ITEM_COUNT})"
+            ))
+        })
+}
+
+/// Reads a patch's `to_add`/`to_remove` counts, rejecting bad pairs before allocating.
+pub(crate) fn read_component_counts(
+    read: &mut impl NetworkReadExt,
+) -> Result<(usize, usize), ReadingError> {
+    let num_to_add = read.get_var_int()?.0;
+    let num_to_remove = read.get_var_int()?.0;
+
+    if num_to_add < 0 || num_to_remove < 0 {
+        return Err(ReadingError::Message("Negative component count".into()));
     }
 
-    (to_add, to_remove)
+    let total_components = num_to_add
+        .checked_add(num_to_remove)
+        .ok_or_else(|| ReadingError::Message("Component count overflow".into()))?;
+
+    if total_components > MAX_COMPONENTS {
+        return Err(ReadingError::Message(
+            "Too many components in ItemStack patch".into(),
+        ));
+    }
+
+    Ok((num_to_add as usize, num_to_remove as usize))
+}
+
+/// Appends an entry to a patch; a repeated id can only come from a malformed packet.
+pub(crate) fn push_component(
+    patch: &mut Vec<(DataComponent, Option<Box<dyn DataComponentImpl>>)>,
+    id: DataComponent,
+    data: Option<Box<dyn DataComponentImpl>>,
+) -> Result<(), ReadingError> {
+    if patch.iter().any(|(existing, _)| *existing == id) {
+        return Err(ReadingError::Message(format!(
+            "Duplicate component ID: {}",
+            id.to_id()
+        )));
+    }
+    patch.push((id, data));
+    Ok(())
 }
 
 fn serialize_item_stack_with_id(
@@ -41,11 +103,11 @@ fn serialize_item_stack_with_id(
         if stack.is_empty() {
             write.put_var_int(&VarInt(0))
         } else {
-            let (to_add, to_remove) = item_component_counts(stack);
+            let (to_add, to_remove) = item_component_counts(stack)?;
             write.put_var_int(&VarInt::from(stack.item_count))?;
             write.put_var_int(&VarInt::from(item_id))?;
-            write.put_var_int(&VarInt::from(to_add))?;
-            write.put_var_int(&VarInt::from(to_remove))?;
+            write.put_var_int(&to_add)?;
+            write.put_var_int(&to_remove)?;
 
             for (id, data) in &stack.patch {
                 if let Some(data) = data {
@@ -106,11 +168,11 @@ fn serialize_length_prefixed_item_stack_with_id(
         if stack.is_empty() {
             write.put_var_int(&VarInt(0))
         } else {
-            let (to_add, to_remove) = item_component_counts(stack);
+            let (to_add, to_remove) = item_component_counts(stack)?;
             write.put_var_int(&VarInt::from(stack.item_count))?;
             write.put_var_int(&VarInt::from(item_id))?;
-            write.put_var_int(&VarInt::from(to_add))?;
-            write.put_var_int(&VarInt::from(to_remove))?;
+            write.put_var_int(&to_add)?;
+            write.put_var_int(&to_remove)?;
 
             for (id, data) in &stack.patch {
                 if let Some(data) = data {
@@ -161,7 +223,9 @@ fn serialize_item_cost_with_id(
     Ok(())
 }
 
-fn read_component_id(read: &mut impl NetworkReadExt) -> Result<DataComponent, ReadingError> {
+pub(crate) fn read_component_id(
+    read: &mut impl NetworkReadExt,
+) -> Result<DataComponent, ReadingError> {
     let id_val = read.get_var_int()?.0;
     let id_u8 = id_val
         .try_into()
@@ -256,51 +320,31 @@ impl ItemStackSerializer<'_> {
     pub fn read(
         read: &mut impl NetworkReadExt,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
-        const MAX_COMPONENTS: i32 = 256;
-
-        let item_count = read.get_var_int()?;
-        if item_count.0 == 0 {
+        let item_count = read.get_var_int()?.0;
+        // Vanilla treats any count that isn't positive as the empty stack.
+        if item_count <= 0 {
             return Ok(ItemStackSerializer(Cow::Borrowed(ItemStack::EMPTY)));
         }
+        let item_count = validate_item_count(item_count)?;
 
         let item_id = read.get_var_int()?;
-        let num_to_add = read.get_var_int()?.0;
-        let num_to_remove = read.get_var_int()?.0;
+        let (num_to_add, num_to_remove) = read_component_counts(read)?;
 
-        if num_to_add < 0 || num_to_remove < 0 {
-            return Err(ReadingError::Message("Negative component count".into()));
-        }
-
-        let total_components = num_to_add
-            .checked_add(num_to_remove)
-            .ok_or_else(|| ReadingError::Message("Component count overflow".into()))?;
-
-        if total_components > MAX_COMPONENTS {
-            return Err(ReadingError::Message(
-                "Too many components in ItemStack patch".into(),
-            ));
-        }
-
-        let mut patch = Vec::with_capacity((num_to_add + num_to_remove) as usize);
+        let mut patch = Vec::with_capacity(num_to_add + num_to_remove);
 
         for _ in 0..num_to_add {
-            let id_val = read.get_var_int()?.0;
-            let id = DataComponent::try_from_id(id_val as u8)
-                .ok_or_else(|| ReadingError::Message(format!("Unknown component ID: {id_val}")))?;
+            let id = read_component_id(read)?;
 
             let component_impl = if id == DataComponent::CustomData {
                 CustomDataImpl::deserialize(read)?.to_dyn()
             } else {
                 deserialize(id, read)?
             };
-            patch.push((id, Some(component_impl)));
+            push_component(&mut patch, id, Some(component_impl))?;
         }
 
         for _ in 0..num_to_remove {
-            let id_val = read.get_var_int()?.0;
-            let id = DataComponent::try_from_id(id_val as u8)
-                .ok_or_else(|| ReadingError::Message("Unknown component ID".into()))?;
-            patch.push((id, None));
+            push_component(&mut patch, read_component_id(read)?, None)?;
         }
 
         let item_id_u16: u16 = item_id
@@ -310,7 +354,7 @@ impl ItemStackSerializer<'_> {
 
         Ok(ItemStackSerializer(Cow::Owned(
             ItemStack::new_with_component(
-                item_count.0 as u8,
+                item_count,
                 Item::from_id(item_id_u16).unwrap_or(&Item::AIR),
                 patch,
             ),
@@ -410,10 +454,8 @@ impl ItemStackSerializer<'_> {
         read: &mut impl NetworkReadExt,
         _version: &JavaMinecraftVersion,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
-        const MAX_COMPONENTS: i32 = 256;
-
         let raw_item_id = read.get_var_int()?;
-        let item_count = read.get_var_int()?;
+        let item_count = validate_item_count(read.get_var_int()?.0)?;
 
         let item_id_u16: u16 = raw_item_id
             .0
@@ -421,51 +463,26 @@ impl ItemStackSerializer<'_> {
             .map_err(|_| ReadingError::Message("Invalid item id!".into()))?;
         let item = Item::from_id(item_id_u16).unwrap_or(&Item::AIR);
 
-        let num_to_add = read.get_var_int()?.0;
-        let num_to_remove = read.get_var_int()?.0;
+        let (num_to_add, num_to_remove) = read_component_counts(read)?;
 
-        if num_to_add < 0 || num_to_remove < 0 {
-            return Err(ReadingError::Message("Negative component count".into()));
-        }
-
-        let total_components = num_to_add
-            .checked_add(num_to_remove)
-            .ok_or_else(|| ReadingError::Message("Component count overflow".into()))?;
-
-        if total_components > MAX_COMPONENTS {
-            return Err(ReadingError::Message(
-                "Too many components in ItemStack patch".into(),
-            ));
-        }
-
-        let mut patch = Vec::with_capacity(total_components as usize);
+        let mut patch = Vec::with_capacity(num_to_add + num_to_remove);
 
         for _ in 0..num_to_add {
-            let id_val = read.get_var_int()?.0;
-            let id = DataComponent::try_from_id(id_val as u8)
-                .ok_or_else(|| ReadingError::Message(format!("Unknown component ID: {id_val}")))?;
+            let id = read_component_id(read)?;
 
             let component_impl = if id == DataComponent::CustomData {
                 CustomDataImpl::deserialize(read)?.to_dyn()
             } else {
                 deserialize(id, read)?
             };
-            patch.push((id, Some(component_impl)));
+            push_component(&mut patch, id, Some(component_impl))?;
         }
 
         for _ in 0..num_to_remove {
-            let id_val = read.get_var_int()?.0;
-            let id = DataComponent::try_from_id(id_val as u8)
-                .ok_or_else(|| ReadingError::Message("Unknown component ID".into()))?;
-            patch.push((id, None));
+            push_component(&mut patch, read_component_id(read)?, None)?;
         }
 
-        let item_count_u8: u8 = item_count
-            .0
-            .try_into()
-            .map_err(|_| ReadingError::Message("Invalid item count!".into()))?;
-
-        let stack = ItemStack::new_with_component(item_count_u8, item, patch);
+        let stack = ItemStack::new_with_component(item_count, item, patch);
         if stack.is_empty() {
             return Err(ReadingError::Message(
                 "Can't read empty item stack template".into(),
@@ -482,44 +499,25 @@ impl ItemStackSerializer<'_> {
     pub fn read_length_prefixed_optional(
         read: &mut impl NetworkReadExt,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
-        const MAX_COMPONENTS: i32 = 256;
-
-        let item_count = read.get_var_int()?;
-        if item_count.0 == 0 {
+        let item_count = read.get_var_int()?.0;
+        // Vanilla treats any count that isn't positive as the empty stack.
+        if item_count <= 0 {
             return Ok(ItemStackSerializer(Cow::Borrowed(ItemStack::EMPTY)));
         }
-        let item_count_u8 = item_count
-            .0
-            .try_into()
-            .map_err(|_| ReadingError::Message("Invalid item count!".into()))?;
+        let item_count_u8 = validate_item_count(item_count)?;
 
         let item_id = read.get_var_int()?;
-        let num_to_add = read.get_var_int()?.0;
-        let num_to_remove = read.get_var_int()?.0;
+        let (num_to_add, num_to_remove) = read_component_counts(read)?;
 
-        if num_to_add < 0 || num_to_remove < 0 {
-            return Err(ReadingError::Message("Negative component count".into()));
-        }
-
-        let total_components = num_to_add
-            .checked_add(num_to_remove)
-            .ok_or_else(|| ReadingError::Message("Component count overflow".into()))?;
-
-        if total_components > MAX_COMPONENTS {
-            return Err(ReadingError::Message(
-                "Too many components in ItemStack patch".into(),
-            ));
-        }
-
-        let mut patch = Vec::with_capacity(total_components as usize);
+        let mut patch = Vec::with_capacity(num_to_add + num_to_remove);
 
         for _ in 0..num_to_add {
             let (id, component_impl) = read_length_prefixed_component(read)?;
-            patch.push((id, Some(component_impl)));
+            push_component(&mut patch, id, Some(component_impl))?;
         }
 
         for _ in 0..num_to_remove {
-            patch.push((read_component_id(read)?, None));
+            push_component(&mut patch, read_component_id(read)?, None)?;
         }
 
         let item_id_u16 = item_id
@@ -614,11 +612,11 @@ impl ItemStackSerializer<'_> {
                 "Can't write empty item stack template".into(),
             ));
         }
-        let (to_add, to_remove) = item_component_counts(self.0.as_ref());
+        let (to_add, to_remove) = item_component_counts(self.0.as_ref())?;
         write.put_var_int(&VarInt::from(self.0.item.id))?;
         write.put_var_int(&VarInt::from(self.0.item_count))?;
-        write.put_var_int(&VarInt::from(to_add))?;
-        write.put_var_int(&VarInt::from(to_remove))?;
+        write.put_var_int(&to_add)?;
+        write.put_var_int(&to_remove)?;
 
         for (id, data) in &self.0.patch {
             if let Some(data) = data {
@@ -670,8 +668,6 @@ pub struct ItemComponentHash {
 
 impl ItemComponentHash {
     pub fn read(read: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
-        const MAX_COMPONENTS: i32 = 256;
-
         let added_length = read.get_var_int()?;
         if added_length.0 < 0 || added_length.0 > MAX_COMPONENTS {
             return Err(ReadingError::Message("added_length out of bounds".into()));
@@ -756,22 +752,8 @@ impl OptionalItemStackHash {
             if hash.item_id != other.item.id.into() || hash.count != other.item_count.into() {
                 return false;
             }
-            let calc = || {
-                let mut to_add = 0u8;
-                let mut to_remove = 0u8;
-                for (_id, data) in &other.patch {
-                    if data.is_none() {
-                        to_remove += 1;
-                    } else {
-                        to_add += 1;
-                    }
-                }
-                (to_add, to_remove)
-            };
-            let (to_add, to_remove) = calc();
-            if to_add as usize != hash.components.added.len()
-                || to_remove as usize != hash.components.removed.len()
-            {
+            let (to_add, to_remove) = patch_counts(other);
+            if to_add != hash.components.added.len() || to_remove != hash.components.removed.len() {
                 return false;
             }
             for (other_id, data) in &other.patch {
@@ -852,5 +834,59 @@ impl From<Option<ItemStack>> for ItemStackOptionalTemplateSerializer<'_> {
             || ItemStackOptionalTemplateSerializer(Cow::Borrowed(ItemStack::EMPTY)),
             ItemStackOptionalTemplateSerializer::from,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_stack(mut bytes: &[u8]) -> Result<ItemStack, ReadingError> {
+        ItemStackSerializer::read(&mut bytes).map(ItemStackSerializer::to_stack)
+    }
+
+    #[test]
+    fn count_above_vanilla_maximum_is_rejected() {
+        assert!(read_stack(&[100, 1, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn count_at_vanilla_maximum_is_read() {
+        assert_eq!(read_stack(&[99, 1, 0, 0]).unwrap().item_count, 99);
+    }
+
+    #[test]
+    fn non_positive_count_is_the_empty_stack() {
+        assert!(read_stack(&[0]).unwrap().is_empty());
+        // -1
+        assert!(
+            read_stack(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn patch_with_256_entries_is_rejected() {
+        // 255 (two-byte VarInt) to add and 1 to remove
+        assert!(read_stack(&[1, 1, 0xFF, 0x01, 1]).is_err());
+    }
+
+    #[test]
+    fn duplicate_component_ids_are_rejected() {
+        let id = DataComponent::Unbreakable.to_id();
+        assert!(read_stack(&[1, 1, 0, 1, id]).is_ok());
+        assert!(read_stack(&[1, 1, 0, 2, id, id]).is_err());
+        assert!(read_stack(&[1, 1, 1, 1, id, id]).is_err());
+    }
+
+    #[test]
+    fn component_counts_do_not_wrap_at_256() {
+        let patch = (0..256)
+            .map(|_| (DataComponent::Unbreakable, None))
+            .collect();
+        let stack = ItemStack::new_with_component(1, &Item::STONE, patch);
+        let (to_add, to_remove) = item_component_counts(&stack).unwrap();
+        assert_eq!((to_add, to_remove), (VarInt(0), VarInt(256)));
     }
 }

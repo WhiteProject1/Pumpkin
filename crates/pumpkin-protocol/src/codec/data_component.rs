@@ -2,6 +2,10 @@
 
 use std::borrow::Cow;
 
+use crate::codec::item_stack_seralizer::{
+    item_component_counts, push_component, read_component_counts, read_component_id,
+    validate_item_count,
+};
 use crate::codec::var_int::VarInt;
 use crate::ser::{NetworkReadExt, NetworkWriteExt, ReadingError, WritingError};
 use pumpkin_data::Enchantment;
@@ -15,6 +19,17 @@ use pumpkin_nbt::{serializer::NbtWriteHelperJava, tag::NbtTag};
 use pumpkin_util::version::JavaMinecraftVersion;
 
 const MAX_STATUS_EFFECTS: usize = 128;
+
+/// Vanilla's `ItemEnchantments` codec only accepts levels in `0..=255`.
+fn validate_enchantment_level(level: i32) -> Result<i32, ReadingError> {
+    if (0..=255).contains(&level) {
+        Ok(level)
+    } else {
+        Err(ReadingError::Message(format!(
+            "Enchantment level {level} is out of bounds (0-255)"
+        )))
+    }
+}
 
 #[must_use]
 pub fn data_to_proto_sound(id_or: &IdOr<SoundEvent>) -> crate::IdOr<crate::SoundEvent> {
@@ -105,9 +120,20 @@ fn deserialize_status_effects(
             .minecraft_name;
         let effect_id = Cow::Borrowed(effect_name);
 
-        // Effect parameters
+        // Effect parameters, bounded like vanilla's codec: the amplifier is a `u8` and
+        // -1 (infinite) is the only negative duration.
         let amplifier = seq.get_var_int()?.0;
+        if !(0..=255).contains(&amplifier) {
+            return Err(ReadingError::Message(format!(
+                "Status effect amplifier {amplifier} is out of bounds (0-255)"
+            )));
+        }
         let duration = seq.get_var_int()?.0;
+        if duration < -1 {
+            return Err(ReadingError::Message(format!(
+                "Status effect duration {duration} is out of bounds"
+            )));
+        }
         let ambient = seq.get_bool()?;
         let show_particles = seq.get_bool()?;
         let show_icon = seq.get_bool()?;
@@ -236,8 +262,8 @@ impl DataComponentCodec<Self> for MaxStackSizeImpl {
         seq.write_var_int(&VarInt::from(self.size))
     }
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
-        let size = u8::try_from(seq.get_var_int()?.0)
-            .map_err(|_| ReadingError::Message("No MaxStackSize VarInt!".into()))?;
+        // Vanilla restricts this to 1-99 like any other stack count.
+        let size = validate_item_count(seq.get_var_int()?.0)?;
         Ok(Self { size })
     }
 }
@@ -248,6 +274,12 @@ impl DataComponentCodec<Self> for DamageImpl {
     }
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let damage = seq.get_var_int()?.0;
+        // Vanilla restricts this to a non-negative int.
+        if damage < 0 {
+            return Err(ReadingError::Message(format!(
+                "Damage {damage} is negative"
+            )));
+        }
         Ok(Self { damage })
     }
 }
@@ -280,12 +312,12 @@ impl DataComponentCodec<Self> for EnchantmentsImpl {
         }
         let mut enc = Vec::with_capacity(len);
         for _ in 0..len {
-            let id = seq.get_var_int()?.0 as u8;
-            let level = seq.get_var_int()?.0;
+            let id = seq.get_var_int()?.0;
+            let level = validate_enchantment_level(seq.get_var_int()?.0)?;
             enc.push((
-                Enchantment::from_id(id).ok_or(ReadingError::Message(
-                    "EnchantmentsImpl Enchantment VarInt Incorrect!".into(),
-                ))?,
+                u8::try_from(id).ok().and_then(Enchantment::from_id).ok_or(
+                    ReadingError::Message("EnchantmentsImpl Enchantment VarInt Incorrect!".into()),
+                )?,
                 level,
             ));
         }
@@ -872,12 +904,14 @@ impl DataComponentCodec<Self> for StoredEnchantmentsImpl {
 
         let mut stored_enchantments = Vec::with_capacity(len);
         for _ in 0..len {
-            let id = seq.get_var_int()?.0 as u8;
-            let level = seq.get_var_int()?.0;
+            let id = seq.get_var_int()?.0;
+            let level = validate_enchantment_level(seq.get_var_int()?.0)?;
             stored_enchantments.push((
-                Enchantment::from_id(id).ok_or(ReadingError::Message(
-                    "StoredEnchantmentsImpl Enchantment VarInt Incorrect!".into(),
-                ))?,
+                u8::try_from(id).ok().and_then(Enchantment::from_id).ok_or(
+                    ReadingError::Message(
+                        "StoredEnchantmentsImpl Enchantment VarInt Incorrect!".into(),
+                    ),
+                )?,
                 level,
             ));
         }
@@ -1264,47 +1298,25 @@ impl DataComponentCodec<Self> for UseCooldownImpl {
 fn deserialize_item_stack_template(
     seq: &mut impl NetworkReadExt,
 ) -> Result<pumpkin_data::item_stack::ItemStack, ReadingError> {
-    const MAX_COMPONENTS: i32 = 256;
-
     let item_id = seq.get_var_int()?.0 as u16;
 
-    let count = seq.get_var_int()?.0 as u8;
+    let count = validate_item_count(seq.get_var_int()?.0)?;
 
-    let num_to_add = seq.get_var_int()?.0;
-    let num_to_remove = seq.get_var_int()?.0;
+    let (num_to_add, num_to_remove) = read_component_counts(seq)?;
 
-    if num_to_add < 0 || num_to_remove < 0 {
-        return Err(ReadingError::Message("Negative component count".into()));
-    }
-
-    let total_components = num_to_add
-        .checked_add(num_to_remove)
-        .ok_or_else(|| ReadingError::Message("Component count overflow".into()))?;
-
-    if total_components > MAX_COMPONENTS {
-        return Err(ReadingError::Message(
-            "Too many components in ItemStackTemplate patch".into(),
-        ));
-    }
-
-    let mut patch = Vec::with_capacity((num_to_add + num_to_remove) as usize);
+    let mut patch = Vec::with_capacity(num_to_add + num_to_remove);
 
     for _ in 0..num_to_add {
-        let id_val = seq.get_var_int()?.0;
-        let id = DataComponent::try_from_id(id_val as u8)
-            .ok_or_else(|| ReadingError::Message(format!("Unknown component ID: {id_val}")))?;
+        let id = read_component_id(seq)?;
 
         let _byte_len = seq.get_var_int()?;
 
         let component_impl = deserialize(id, seq)?;
-        patch.push((id, Some(component_impl)));
+        push_component(&mut patch, id, Some(component_impl))?;
     }
 
     for _ in 0..num_to_remove {
-        let id_val = seq.get_var_int()?.0;
-        let id = DataComponent::try_from_id(id_val as u8)
-            .ok_or_else(|| ReadingError::Message("Unknown component ID".into()))?;
-        patch.push((id, None));
+        push_component(&mut patch, read_component_id(seq)?, None)?;
     }
 
     Ok(pumpkin_data::item_stack::ItemStack::new_with_component(
@@ -1321,18 +1333,9 @@ fn serialize_item_stack_template(
     seq.write_var_int(&VarInt::from(stack.item.id))?;
     seq.write_var_int(&VarInt::from(stack.item_count))?;
 
-    let mut to_add = 0u8;
-    let mut to_remove = 0u8;
-    for (_id, data) in &stack.patch {
-        if data.is_none() {
-            to_remove += 1;
-        } else {
-            to_add += 1;
-        }
-    }
-
-    seq.write_var_int(&VarInt::from(to_add))?;
-    seq.write_var_int(&VarInt::from(to_remove))?;
+    let (to_add, to_remove) = item_component_counts(stack)?;
+    seq.write_var_int(&to_add)?;
+    seq.write_var_int(&to_remove)?;
 
     for (id, data) in &stack.patch {
         if let Some(data) = data {
@@ -1517,8 +1520,11 @@ impl DataComponentCodec<Self> for CanPlaceOnImpl {
             }
             let exact_len = seq.get_var_int()?.0;
             for _ in 0..exact_len {
-                let comp_id = seq.get_var_int()?.0 as u8;
-                if let Some(comp) = DataComponent::try_from_id(comp_id) {
+                let comp_id = seq.get_var_int()?.0;
+                if let Some(comp) = u8::try_from(comp_id)
+                    .ok()
+                    .and_then(DataComponent::try_from_id)
+                {
                     let _ = deserialize(comp, seq)?;
                 }
             }
@@ -1576,8 +1582,11 @@ impl DataComponentCodec<Self> for CanBreakImpl {
             }
             let exact_len = seq.get_var_int()?.0;
             for _ in 0..exact_len {
-                let comp_id = seq.get_var_int()?.0 as u8;
-                if let Some(comp) = DataComponent::try_from_id(comp_id) {
+                let comp_id = seq.get_var_int()?.0;
+                if let Some(comp) = u8::try_from(comp_id)
+                    .ok()
+                    .and_then(DataComponent::try_from_id)
+                {
                     let _ = deserialize(comp, seq)?;
                 }
             }
@@ -2883,5 +2892,29 @@ mod tests {
         let decoded = ProfileImpl::deserialize(&mut encoded.as_slice()).unwrap();
         assert_eq!(decoded.name.as_deref(), Some("Notch"));
         assert_eq!(decoded.id, Some([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn max_stack_size_outside_vanilla_range_is_rejected() {
+        assert!(MaxStackSizeImpl::deserialize(&mut [0u8].as_slice()).is_err());
+        assert!(MaxStackSizeImpl::deserialize(&mut [100u8].as_slice()).is_err());
+        let size = MaxStackSizeImpl::deserialize(&mut [99u8].as_slice()).unwrap();
+        assert_eq!(size.size, 99);
+    }
+
+    #[test]
+    fn negative_damage_is_rejected() {
+        let mut encoded = Vec::new();
+        VarInt(-1).encode(&mut encoded).unwrap();
+        assert!(DamageImpl::deserialize(&mut encoded.as_slice()).is_err());
+    }
+
+    #[test]
+    fn enchantment_level_above_255_is_rejected() {
+        // one enchantment with id 0
+        let mut encoded = vec![1, 0];
+        VarInt(256).encode(&mut encoded).unwrap();
+        assert!(EnchantmentsImpl::deserialize(&mut encoded.as_slice()).is_err());
+        assert!(StoredEnchantmentsImpl::deserialize(&mut encoded.as_slice()).is_err());
     }
 }
