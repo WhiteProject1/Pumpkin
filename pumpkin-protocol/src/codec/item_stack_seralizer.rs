@@ -2,6 +2,7 @@ use crate::VarInt;
 use crate::codec::data_component::{deserialize, serialize};
 use crate::ser::{WritingError, serializer};
 use pumpkin_data::data_component::DataComponent;
+use pumpkin_data::data_component_impl::DataComponentImpl;
 use pumpkin_data::item::Item;
 use pumpkin_data::item_id_remap::{remap_item_id_for_version, remap_item_id_from_version};
 use pumpkin_util::version::MinecraftVersion;
@@ -73,14 +74,20 @@ impl<'de> Deserialize<'de> for ItemStackSerializer<'static> {
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                const MAX_COMPONENTS: i32 = 256;
+                // The per-kind counters are `u8`s, so 256 entries would wrap them to 0.
+                const MAX_COMPONENTS: i32 = 255;
+                // Vanilla `ItemStack` codec limit
+                const MAX_ITEM_COUNT: i32 = 99;
 
                 let item_count = seq
                     .next_element::<VarInt>()?
                     .ok_or_else(|| de::Error::custom("Failed to decode VarInt"))?;
 
-                if item_count.0 == 0 {
+                if item_count.0 <= 0 {
                     return Ok(ItemStackSerializer(Cow::Borrowed(ItemStack::EMPTY)));
+                }
+                if item_count.0 > MAX_ITEM_COUNT {
+                    return Err(de::Error::custom("Item count out of range"));
                 }
 
                 let item_id = seq
@@ -102,16 +109,23 @@ impl<'de> Deserialize<'de> for ItemStackSerializer<'static> {
                     return Err(de::Error::custom("Too many components in ItemStack patch"));
                 }
 
-                let mut patch = Vec::with_capacity((num_to_add + num_to_remove) as usize);
+                let mut patch: Vec<(DataComponent, Option<Box<dyn DataComponentImpl>>)> =
+                    Vec::with_capacity((num_to_add + num_to_remove) as usize);
 
                 for _ in 0..num_to_add {
                     let id_val = seq
                         .next_element::<VarInt>()?
                         .ok_or_else(|| de::Error::custom("Missing component ID"))?
                         .0;
-                    let id = DataComponent::try_from_id(id_val as u8).ok_or_else(|| {
-                        de::Error::custom(format!("Unknown component ID: {id_val}"))
-                    })?;
+                    let id = u8::try_from(id_val)
+                        .ok()
+                        .and_then(DataComponent::try_from_id)
+                        .ok_or_else(|| {
+                            de::Error::custom(format!("Unknown component ID: {id_val}"))
+                        })?;
+                    if patch.iter().any(|(existing, _)| *existing == id) {
+                        return Err(de::Error::custom("Duplicate component in ItemStack patch"));
+                    }
 
                     // Minecraft protocol sends a byte length for the component data here
                     let _byte_len = seq
@@ -128,8 +142,13 @@ impl<'de> Deserialize<'de> for ItemStackSerializer<'static> {
                         .next_element::<VarInt>()?
                         .ok_or_else(|| de::Error::custom("Missing remove component ID"))?
                         .0;
-                    let id = DataComponent::try_from_id(id_val as u8)
+                    let id = u8::try_from(id_val)
+                        .ok()
+                        .and_then(DataComponent::try_from_id)
                         .ok_or_else(|| de::Error::custom("Unknown component ID"))?;
+                    if patch.iter().any(|(existing, _)| *existing == id) {
+                        return Err(de::Error::custom("Duplicate component in ItemStack patch"));
+                    }
                     patch.push((id, None));
                 }
 
@@ -360,5 +379,69 @@ impl<'de> Deserialize<'de> for ItemComponentHash {
         }
 
         deserializer.deserialize_seq(Visitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use serde::Deserialize;
+
+    use super::*;
+    use crate::ser::{NetworkWriteExt, deserializer::Deserializer};
+
+    fn parse(bytes: Vec<u8>) -> Result<ItemStack, crate::ser::ReadingError> {
+        let mut deserializer = Deserializer::new(Cursor::new(bytes));
+        ItemStackSerializer::deserialize(&mut deserializer).map(ItemStackSerializer::to_stack)
+    }
+
+    #[test]
+    fn count_out_of_range_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.write_var_int(&VarInt(100)).unwrap();
+        bytes.write_var_int(&VarInt(1)).unwrap();
+        bytes.write_var_int(&VarInt(0)).unwrap();
+        bytes.write_var_int(&VarInt(0)).unwrap();
+        assert!(parse(bytes).is_err());
+
+        // A non-positive count is the empty stack.
+        let mut bytes = Vec::new();
+        bytes.write_var_int(&VarInt(-5)).unwrap();
+        assert!(parse(bytes).unwrap().is_empty());
+    }
+
+    /// A chain of "hidden" potion effects used to recurse once per level (6 bytes each) and
+    /// could overflow the stack; it must now fail cleanly past the depth limit.
+    #[test]
+    fn deeply_nested_hidden_effects_are_rejected() {
+        let mut bytes = Vec::new();
+        bytes.write_var_int(&VarInt(1)).unwrap(); // count
+        bytes.write_var_int(&VarInt(1)).unwrap(); // item id
+        bytes.write_var_int(&VarInt(1)).unwrap(); // components to add
+        bytes.write_var_int(&VarInt(0)).unwrap(); // components to remove
+        bytes
+            .write_var_int(&VarInt::from(DataComponent::PotionContents.to_id()))
+            .unwrap();
+        bytes.write_var_int(&VarInt(0)).unwrap(); // (ignored) data length
+        bytes.write_bool(false).unwrap(); // no potion id
+        bytes.write_bool(false).unwrap(); // no custom color
+        bytes.write_var_int(&VarInt(1)).unwrap(); // one effect
+        bytes.write_var_int(&VarInt(1)).unwrap(); // effect id
+        bytes.write_var_int(&VarInt(0)).unwrap(); // amplifier
+        bytes.write_var_int(&VarInt(10)).unwrap(); // duration
+        bytes.write_bool(false).unwrap();
+        bytes.write_bool(false).unwrap();
+        bytes.write_bool(false).unwrap();
+        bytes.write_bool(true).unwrap(); // has hidden effect
+        for _ in 0..100_000 {
+            bytes.write_var_int(&VarInt(0)).unwrap();
+            bytes.write_var_int(&VarInt(0)).unwrap();
+            bytes.write_bool(false).unwrap();
+            bytes.write_bool(false).unwrap();
+            bytes.write_bool(false).unwrap();
+            bytes.write_bool(true).unwrap();
+        }
+        assert!(parse(bytes).is_err());
     }
 }

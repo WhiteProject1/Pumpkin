@@ -23,7 +23,7 @@ const POWER: f32 = 1.5;
 impl ItemBehaviour for EggItem {
     fn normal_use<'a>(
         &'a self,
-        _block: &'a Item,
+        item: &'a Item,
         player: &'a Player,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
@@ -37,8 +37,22 @@ impl ItemBehaviour for EggItem {
                 )
                 .await;
 
-            // Capture the held item stack and pass it to the thrown egg entity
-            let item_stack: ItemStack = player.inventory.held_item().lock().await.clone();
+            // Consume the egg from the hand it was thrown from (the main hand is tried first,
+            // like vanilla) and capture its stack to pass it to the thrown egg entity
+            let held = player.inventory.held_item();
+            let stack = if held.lock().await.item.id == item.id {
+                held
+            } else {
+                player.inventory.off_hand_item().await
+            };
+            let item_stack: ItemStack = {
+                let mut stack = stack.lock().await;
+                let item_stack = stack.clone();
+                if stack.item.id == item.id {
+                    stack.decrement_unless_creative(player.gamemode.load(), 1);
+                }
+                item_stack
+            };
 
             let entity = Entity::new(world.clone(), position, &EntityType::EGG);
             let egg = EggEntity::new_shot(entity, &player.living_entity.entity).await;

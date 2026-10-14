@@ -22,7 +22,7 @@ const POWER: f32 = 1.5;
 impl ItemBehaviour for SnowBallItem {
     fn normal_use<'a>(
         &'a self,
-        _block: &'a Item,
+        item: &'a Item,
         player: &'a Player,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
@@ -48,6 +48,19 @@ impl ItemBehaviour for SnowBallItem {
                 1.0,
             );
             world.spawn_entity(Arc::new(snowball)).await;
+
+            // Consume the snowball from the hand it was thrown from (the main hand is tried
+            // first, like vanilla)
+            let held = player.inventory.held_item();
+            let stack = if held.lock().await.item.id == item.id {
+                held
+            } else {
+                player.inventory.off_hand_item().await
+            };
+            let mut stack = stack.lock().await;
+            if stack.item.id == item.id {
+                stack.decrement_unless_creative(player.gamemode.load(), 1);
+            }
         })
     }
 

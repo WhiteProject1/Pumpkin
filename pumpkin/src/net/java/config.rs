@@ -4,7 +4,7 @@ use crate::{
     entity::player::ChatMode,
     net::{
         PlayerConfig, can_not_join,
-        java::{JavaClient, PacketHandlerResult},
+        java::{JavaClient, LoginStage, PacketHandlerResult},
     },
     server::Server,
 };
@@ -138,7 +138,11 @@ impl JavaClient {
                 self.id
             );
         }
-        self.send_known_packs().await;
+        // Only while the configuration is still waiting for the pack answer; afterwards a
+        // repeated response must not restart the registry sync.
+        if self.login_stage.load() == LoginStage::Configuring {
+            self.send_known_packs().await;
+        }
     }
 
     pub fn handle_config_cookie_response(&self, packet: &SConfigCookieResponse) {
@@ -153,6 +157,11 @@ impl JavaClient {
 
     pub async fn handle_known_packs(&self, _config_acknowledged: SKnownPacks) {
         debug!("Handling known packs");
+        // One-shot: the registry sync is expensive and the client has no reason to ask twice.
+        if !self.expect_login_stage(LoginStage::Configuring).await {
+            return;
+        }
+        self.login_stage.store(LoginStage::FinishingConfig);
         // let mut tags_to_send = Vec::new();
         let registry = Registry::get_synced(self.version.load());
         for registry in registry {
@@ -206,17 +215,24 @@ impl JavaClient {
 
     pub async fn handle_config_acknowledged(&self, server: &Arc<Server>) -> PacketHandlerResult {
         debug!("Handling config acknowledgement");
-        self.connection_state.store(ConnectionState::Play);
+        if !self.expect_login_stage(LoginStage::FinishingConfig).await {
+            return PacketHandlerResult::Stop;
+        }
 
         let profile = self.gameprofile.lock().await.clone();
-        let profile = profile.unwrap();
-        let address = self.address.lock().await;
+        let Some(profile) = profile else {
+            // Can't happen once the stage checks passed, but never trust it blindly.
+            self.kick(TextComponent::text("No `GameProfile`")).await;
+            return PacketHandlerResult::Stop;
+        };
+        let address = *self.address.lock().await;
 
         if let Some(reason) = can_not_join(&profile, &address, server).await {
             self.kick(reason).await;
             return PacketHandlerResult::Stop;
         }
 
+        self.connection_state.store(ConnectionState::Play);
         let config = self.config.lock().await;
         PacketHandlerResult::ReadyToPlay(profile, config.clone().unwrap_or_default())
     }

@@ -1,9 +1,10 @@
 use crate::net::authentication::MOJANG_BEDROCK_PUBLIC_KEY_BASE64;
 use crate::{
-    net::{ClientPlatform, DisconnectReason, GameProfile, bedrock::BedrockClient},
+    net::{ClientPlatform, DisconnectReason, GameProfile, bedrock::BedrockClient, can_not_join},
     server::Server,
 };
 use pumpkin_config::networking::compression::CompressionInfo;
+use pumpkin_data::translation;
 use pumpkin_protocol::bedrock::server::resource_pack_response::SResourcePackResponse;
 use pumpkin_protocol::{
     bedrock::{
@@ -18,9 +19,10 @@ use pumpkin_protocol::{
     codec::var_uint::VarUInt,
 };
 use pumpkin_util::jwt::{AuthError, verify_chain};
+use pumpkin_util::text::TextComponent;
 use pumpkin_world::CURRENT_BEDROCK_MC_VERSION;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use thiserror::Error;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -35,6 +37,17 @@ pub enum LoginError {
     InvalidUsername,
     #[error("Could not parse UUID from validated token")]
     InvalidUuid,
+    #[error("Received a second login packet")]
+    AlreadyLoggedIn,
+    #[error("The server is full")]
+    ServerFull,
+    #[error("The player is not allowed to join: {0}")]
+    NotAllowed(String),
+}
+
+/// Mirrors the username rules of the Java login: at most 16 characters and no control characters or spaces.
+fn is_valid_display_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 16 && !name.chars().any(|c| c.is_control() || c == ' ')
 }
 
 #[derive(Deserialize)]
@@ -60,12 +73,30 @@ impl BedrockClient {
             Ok(()) => Some(()),
             Err(error) => {
                 warn!("Bedrock login failed: {error}");
-                let message = match error {
-                    LoginError::InvalidUsername => "Your username is invalid.".to_string(),
-                    _ => "Failed to log in. The data sent by your client was invalid.".to_string(),
+                let (reason, message) = match error {
+                    LoginError::InvalidUsername => (
+                        DisconnectReason::LoginPacketNoRequest,
+                        "Your username is invalid.".to_string(),
+                    ),
+                    LoginError::AlreadyLoggedIn => (
+                        DisconnectReason::Kicked,
+                        "Received a second login packet.".to_string(),
+                    ),
+                    LoginError::ServerFull => (
+                        DisconnectReason::ServerFull,
+                        TextComponent::translate(
+                            translation::MULTIPLAYER_DISCONNECT_SERVER_FULL,
+                            [],
+                        )
+                        .get_text(),
+                    ),
+                    LoginError::NotAllowed(message) => (DisconnectReason::Kicked, message),
+                    _ => (
+                        DisconnectReason::LoginPacketNoRequest,
+                        "Failed to log in. The data sent by your client was invalid.".to_string(),
+                    ),
                 };
-                self.kick(DisconnectReason::LoginPacketNoRequest, message)
-                    .await;
+                self.kick(reason, message).await;
                 None
             }
         }
@@ -76,6 +107,12 @@ impl BedrockClient {
         packet: SLogin,
         server: &Server,
     ) -> Result<(), LoginError> {
+        // A client logs in exactly once; the flag (rather than `self.player`) also covers two login
+        // packets racing each other, since every datagram is handled in its own task.
+        if self.login_started.swap(true, Ordering::AcqRel) {
+            return Err(LoginError::AlreadyLoggedIn);
+        }
+
         let outer_payload: FullLoginPayload = serde_json::from_slice(&packet.jwt)?;
         let inner_payload: CertificateChainPayload =
             serde_json::from_str(&outer_payload.certificate)?;
@@ -83,12 +120,27 @@ impl BedrockClient {
         let chain_vec: Vec<&str> = inner_payload.chain.iter().map(String::as_str).collect();
         let player_data = verify_chain(&chain_vec, MOJANG_BEDROCK_PUBLIC_KEY_BASE64)?;
 
+        if !is_valid_display_name(&player_data.display_name) {
+            return Err(LoginError::InvalidUsername);
+        }
+
         let profile = GameProfile {
             id: Uuid::parse_str(&player_data.uuid).map_err(|_| LoginError::InvalidUuid)?,
             name: player_data.display_name,
             properties: Vec::new(),
             profile_actions: None,
         };
+
+        // Don't allow new logons when the server is full.
+        // If `max_players` is set to zero, then there is no max player count enforced.
+        let max_players = server.basic_config.max_players;
+        if max_players > 0 && server.get_player_count() >= max_players as usize {
+            return Err(LoginError::ServerFull);
+        }
+
+        if let Some(reason) = can_not_join(&profile, &self.address, server).await {
+            return Err(LoginError::NotAllowed(reason.get_text()));
+        }
 
         //let raw_token = unsafe { String::from_utf8_unchecked(packet.raw_token) };
         //let raw_token: Vec<&str> = raw_token.split('.').collect();

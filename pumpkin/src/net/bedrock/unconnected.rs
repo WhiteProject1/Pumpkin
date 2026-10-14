@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use pumpkin_protocol::bedrock::{
+    RAKNET_MAGIC,
     client::raknet::unconnected_pong::{CUnconnectedPong, ServerInfo},
     server::raknet::unconnected_ping::SUnconnectedPing,
 };
@@ -47,7 +48,7 @@ impl BedrockClient {
             &CUnconnectedPong::new(
                 packet.time,
                 server.server_guid,
-                packet.magic,
+                RAKNET_MAGIC,
                 format!("{motd_string}"),
             ),
             addr,

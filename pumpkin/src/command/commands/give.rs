@@ -1,5 +1,4 @@
-use pumpkin_data::data_component::DataComponent::MaxStackSize;
-use pumpkin_data::data_component_impl::{MaxStackSizeImpl, get};
+use pumpkin_data::translation;
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::text::hover::HoverEvent;
 use pumpkin_world::item::ItemStack;
@@ -58,15 +57,22 @@ impl CommandExecutor for Executor {
                 }
             };
 
-            for target in targets {
-                let max_stack = i32::from(
-                    item.components
-                        .iter()
-                        .find_map(|(id, component)| {
-                            (id == &MaxStackSize).then(|| get::<MaxStackSizeImpl>(*component).size)
-                        })
-                        .unwrap(),
+            let max_stack = i32::from(ItemStack::new(1, item).get_max_stack_size());
+
+            // Like vanilla: never give more than 100 stacks at once
+            let max_count = max_stack * 100;
+            if item_count > max_count {
+                let msg = TextComponent::translate(
+                    translation::COMMANDS_GIVE_FAILED_TOOMANYITEMS,
+                    [
+                        TextComponent::text(max_count.to_string()),
+                        item.translated_name(),
+                    ],
                 );
+                return Err(CommandError::CommandFailed(msg));
+            }
+
+            for target in targets {
                 let mut remaining = item_count;
 
                 while remaining > 0 {

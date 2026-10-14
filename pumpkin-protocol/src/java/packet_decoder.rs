@@ -10,6 +10,9 @@ use crate::{
 
 // decrypt -> decompress -> raw
 
+/// Upper bound for the payload buffer we pre-allocate from a client declared length.
+const MAX_PAYLOAD_PREALLOC: usize = 64 * 1024;
+
 pub enum DecompressionReader<R: AsyncRead + Unpin> {
     Decompress(ZlibDecoder<BufReader<R>>),
     None(R),
@@ -119,7 +122,7 @@ impl<R: AsyncRead + Unpin> TCPNetworkDecoder<R> {
         let mut expected_packet_data_len = packet_len as usize;
         let mut expected_uncompressed_packet_data_len = None;
 
-        let mut reader = if let Some(threshold) = self.compression {
+        let reader = if let Some(threshold) = self.compression {
             let decompressed_length = VarInt::decode_async(&mut bounded_reader).await?;
             let raw_packet_length = packet_len - decompressed_length.written_size() as u64;
             let decompressed_length = decompressed_length.0 as usize;
@@ -148,13 +151,27 @@ impl<R: AsyncRead + Unpin> TCPNetworkDecoder<R> {
         // TODO: Serde is sync so we need to write to a buffer here :(
         // Is there a way to deserialize in an asynchronous manner?
 
+        // Never inflate more than the client declared (+1 so an over-long stream is still
+        // detected below). Without this bound a 2 MiB zlib bomb inflates to ~2 GiB in memory
+        // before the length check runs.
+        let mut reader = reader.take(expected_packet_data_len as u64 + 1);
+
         let packet_id = VarInt::decode_async(&mut reader)
             .await
             .map_err(|_| PacketDecodeError::DecodeID)?
             .0;
+        // `to_id()` yields -1 for packets a protocol version doesn't have; a negative id on
+        // the wire must never be allowed to match one of those arms.
+        if packet_id < 0 {
+            return Err(PacketDecodeError::DecodeID);
+        }
         let packet_id_len = VarInt(packet_id).written_size();
 
-        let payload_len_hint = expected_packet_data_len.saturating_sub(packet_id_len);
+        // Only pre-allocate a modest amount: the declared length is attacker controlled and
+        // `BytesMut` grows amortized anyway.
+        let payload_len_hint = expected_packet_data_len
+            .saturating_sub(packet_id_len)
+            .min(MAX_PAYLOAD_PREALLOC);
         self.payload_scratch.clear();
         self.payload_scratch.reserve(payload_len_hint);
         loop {
@@ -167,13 +184,15 @@ impl<R: AsyncRead + Unpin> TCPNetworkDecoder<R> {
             }
         }
 
+        let decoded_packet_data_len = packet_id_len + self.payload_scratch.len();
         if let Some(expected_uncompressed_packet_data_len) = expected_uncompressed_packet_data_len {
-            let decoded_packet_data_len = packet_id_len + self.payload_scratch.len();
             if decoded_packet_data_len != expected_uncompressed_packet_data_len {
                 return Err(PacketDecodeError::FailedDecompression(format!(
                     "Declared decompressed length {expected_uncompressed_packet_data_len} but decoded {decoded_packet_data_len} bytes"
                 )));
             }
+        } else if decoded_packet_data_len > expected_packet_data_len {
+            return Err(PacketDecodeError::TooLong);
         }
 
         let payload = self.payload_scratch.split().freeze();
@@ -388,6 +407,36 @@ mod tests {
         let result = decoder.get_raw_packet().await;
 
         assert!(result.is_err(), "This should have errored!");
+    }
+
+    /// A packet that declares a small decompressed size but whose zlib stream inflates to far
+    /// more must be rejected without inflating the whole stream into memory.
+    #[tokio::test]
+    async fn decode_rejects_decompression_bomb() {
+        // ~16 MiB of zeros compresses to a few KiB.
+        let bomb_payload = vec![0u8; 16 * 1024 * 1024];
+        let mut data_to_compress = Vec::new();
+        data_to_compress.write_var_int(&VarInt(1)).unwrap();
+        data_to_compress.write_slice(&bomb_payload).unwrap();
+        let compressed = compress_zlib(&data_to_compress);
+        assert!(compressed.len() < MAX_PACKET_SIZE as usize);
+
+        let mut body = Vec::new();
+        // Lie about the decompressed length.
+        body.write_var_int(&VarInt(64)).unwrap();
+        body.write_slice(&compressed).unwrap();
+
+        let mut packet = Vec::new();
+        packet.write_var_int(&VarInt(body.len() as i32)).unwrap();
+        packet.write_slice(&body).unwrap();
+
+        let mut decoder = TCPNetworkDecoder::new(packet.as_slice());
+        decoder.set_compression(1);
+
+        let result = decoder.get_raw_packet().await;
+        assert!(result.is_err(), "decompression bomb must be rejected");
+        // We must have stopped reading right after the declared length.
+        assert!(decoder.payload_scratch.capacity() < 1024 * 1024);
     }
 
     /// Test decoding with a zero-length packet

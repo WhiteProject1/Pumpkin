@@ -4,6 +4,8 @@
 //! sent by a Minecraft: Bedrock Edition client. It handles cryptographic signature
 //! verification, public key extraction, and decoding of player data.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use base64::{Engine as _, engine::general_purpose};
 use ecdsa::Signature;
 use p384::PublicKey;
@@ -12,6 +14,14 @@ use p384::pkcs8::DecodePublicKey;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
+
+/// Number of tokens in a Mojang-issued certificate chain:
+/// the client's self-signed token, the Mojang root token and the Mojang authentication token.
+const CHAIN_LENGTH: usize = 3;
+/// Index of the token in the chain that must be signed by the Mojang root key.
+const MOJANG_SIGNED_INDEX: usize = 1;
+/// Tolerated clock difference (in seconds) when checking the `exp` and `nbf` claims.
+const CLOCK_DRIFT_MAX: i64 = 60;
 
 /// Represents the claims extracted from the player's JWT token.
 ///
@@ -35,6 +45,15 @@ pub enum AuthError {
     /// Indicates that a JWT token has an invalid format (not enough parts).
     #[error("Invalid token format")]
     InvalidTokenFormat,
+    /// Indicates that the chain does not have the expected number of tokens.
+    #[error("Expected a chain of {CHAIN_LENGTH} tokens, got {0}")]
+    InvalidChainLength(usize),
+    /// Indicates that a token's `exp` claim lies in the past.
+    #[error("Token has expired")]
+    TokenExpired,
+    /// Indicates that a token's `nbf` claim lies in the future.
+    #[error("Token is not valid yet")]
+    TokenNotYetValid,
     /// Indicates that the 'x5u' (X.509 URL) header parameter is missing from a token.
     #[error("x5u not found in header")]
     MissingX5U,
@@ -135,13 +154,32 @@ pub fn decode_header_get_x5u(header_b64: &str) -> Result<String, AuthError> {
     Err(AuthError::MissingX5U)
 }
 
+/// Checks the `exp` and `nbf` claims of a token payload against the current time.
+///
+/// Both claims are optional. A claim that is present but not an integer is treated as failing,
+/// so a malformed claim can never widen a token's validity window.
+fn verify_time_claims(payload: &Value, now: i64) -> Result<(), AuthError> {
+    if let Some(exp) = payload.get("exp")
+        && exp.as_i64().unwrap_or(i64::MIN) < now - CLOCK_DRIFT_MAX
+    {
+        return Err(AuthError::TokenExpired);
+    }
+    if let Some(nbf) = payload.get("nbf")
+        && nbf.as_i64().unwrap_or(i64::MAX) > now + CLOCK_DRIFT_MAX
+    {
+        return Err(AuthError::TokenNotYetValid);
+    }
+    Ok(())
+}
+
 /// Verifies a chain of JWT tokens from a Minecraft: Bedrock Edition client.
 ///
 /// This function performs the following steps:
-/// 1. Decodes and verifies each token in the chain.
-/// 2. Ensures that the chain is properly linked, with each token being signed by the key from the previous one.
-/// 3. Verifies that the second token in the chain is signed by the trusted Mojang public key.
-/// 4. Extracts and returns the player's claims from the final token in the chain.
+/// 1. Requires the chain to consist of exactly three tokens.
+/// 2. Decodes and verifies each token in the chain, including its `exp` and `nbf` claims.
+/// 3. Ensures that the chain is properly linked, with each token being signed by the key from the previous one.
+/// 4. Verifies that the second token in the chain is signed by the trusted Mojang public key.
+/// 5. Extracts and returns the player's claims from the final token in the chain.
 ///
 /// # Arguments
 ///
@@ -159,6 +197,12 @@ pub fn verify_chain(raw_chain: &[&str], mojang_key_b64: &str) -> Result<PlayerCl
         .map(|t| t.trim().replace(['\n', '\r'], ""))
         .collect();
 
+    // A shorter chain (e.g. a single self-signed token) would never reach the token that has to
+    // be signed by Mojang, letting the client pick its own identity.
+    if tokens.len() != CHAIN_LENGTH {
+        return Err(AuthError::InvalidChainLength(tokens.len()));
+    }
+
     let first_token = tokens.first().ok_or(AuthError::InvalidTokenFormat)?;
     let first_header_b64 = first_token
         .split('.')
@@ -168,6 +212,13 @@ pub fn verify_chain(raw_chain: &[&str], mojang_key_b64: &str) -> Result<PlayerCl
     let mut current_verifying_key = VerifyingKey::from(build_public_key_from_b64(
         &decode_header_get_x5u(first_header_b64)?,
     )?);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+
+    let mut mojang_signed = false;
 
     // 4. Verification Loop
     for (i, token) in tokens.iter().enumerate() {
@@ -183,8 +234,11 @@ pub fn verify_chain(raw_chain: &[&str], mojang_key_b64: &str) -> Result<PlayerCl
             .verify(signing_input.as_bytes(), &signature)
             .map_err(|_| AuthError::InvalidSignature)?;
 
-        if i == 1 && current_verifying_key != mojang_pk {
-            return Err(AuthError::MojangKeyMismatch);
+        if i == MOJANG_SIGNED_INDEX {
+            if current_verifying_key != mojang_pk {
+                return Err(AuthError::MojangKeyMismatch);
+            }
+            mojang_signed = true;
         }
 
         let payload_b64 = signing_input
@@ -194,9 +248,15 @@ pub fn verify_chain(raw_chain: &[&str], mojang_key_b64: &str) -> Result<PlayerCl
         let payload_bytes = decode_b64_url_nopad(payload_b64)?;
         let payload: Value = serde_json::from_slice(&payload_bytes)?;
 
+        verify_time_claims(&payload, now)?;
+
         if let Some(next_key_b64) = payload.get("identityPublicKey").and_then(|v| v.as_str()) {
             current_verifying_key = VerifyingKey::from(build_public_key_from_b64(next_key_b64)?);
         }
+    }
+
+    if !mojang_signed {
+        return Err(AuthError::MojangKeyMismatch);
     }
 
     let last_token = tokens.last().ok_or(AuthError::InvalidTokenFormat)?;

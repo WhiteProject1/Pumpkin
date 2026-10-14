@@ -14,6 +14,7 @@ use pumpkin_data::item::Item;
 use pumpkin_world::inventory::Inventory;
 use pumpkin_world::item::ItemStack;
 use tokio::{sync::Mutex, time::timeout};
+use tracing::error;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -72,11 +73,18 @@ pub trait Slot: Send + Sync {
         // Default implementation logic:
         Box::pin(async move {
             let stack = self.get_stack().await;
-            let lock = timeout(Duration::from_secs(5), stack.lock())
+            timeout(Duration::from_secs(5), stack.lock())
                 .await
-                .expect("Timed out while trying to acquire lock");
-
-            lock.clone()
+                .map_or_else(
+                    |_| {
+                        error!(
+                            "Timed out while trying to acquire the stack lock of slot {}",
+                            self.get_index()
+                        );
+                        ItemStack::EMPTY.clone()
+                    },
+                    |lock| lock.clone(),
+                )
         })
     }
 
@@ -228,9 +236,11 @@ pub trait Slot: Send + Sync {
             if !stack.is_empty() && self.can_insert(&stack).await {
                 let stack_mutex = self.get_stack().await;
                 let mut stack_self = stack_mutex.lock().await;
-                let min_count = count
-                    .min(stack.item_count)
-                    .min(self.get_max_item_count_for_stack(&stack).await - stack_self.item_count);
+                let min_count = count.min(stack.item_count).min(
+                    self.get_max_item_count_for_stack(&stack)
+                        .await
+                        .saturating_sub(stack_self.item_count),
+                );
 
                 if min_count != 0 {
                     if stack_self.is_empty() {

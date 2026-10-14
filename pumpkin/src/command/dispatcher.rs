@@ -98,6 +98,11 @@ impl CommandDispatcher {
         };
         let mut raw_args: Vec<&str> = parts.rev().collect();
 
+        if !self.can_use(src, server, key).await {
+            debug!("Permission denied for suggestions of command \"{cmd}\"");
+            return Vec::new();
+        }
+
         let Ok(tree) = self.get_tree(key) else {
             return Vec::new();
         };
@@ -275,6 +280,16 @@ impl CommandDispatcher {
         Err(CommandFailed(TextComponent::text(format!(
             "Invalid Syntax. Usage: {tree}"
         ))))
+    }
+
+    /// Whether `src` has the permission registered for the command (or alias) `key`.
+    ///
+    /// Unknown commands are never usable.
+    pub async fn can_use(&self, src: &CommandSender, server: &Server, key: &str) -> bool {
+        match self.permissions.get(key) {
+            Some(permission) => src.has_permission(server, permission.as_str()).await,
+            None => false,
+        }
     }
 
     pub fn get_tree<'a>(&'a self, key: &str) -> Result<&'a CommandTree, CommandError> {

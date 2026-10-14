@@ -303,7 +303,7 @@ impl JavaClient {
         }
         // y = feet Y
         let position = packet.position;
-        if position.x.is_nan() || position.y.is_nan() || position.z.is_nan() {
+        if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
             self.kick(TextComponent::translate(
                 translation::MULTIPLAYER_DISCONNECT_INVALID_PLAYER_MOVEMENT,
                 [],
@@ -800,7 +800,11 @@ impl JavaClient {
                     entity.set_sprinting(false).await;
                 }
             }
-            Action::LeaveBed => player.wake_up().await,
+            Action::LeaveBed => {
+                if player.is_sleeping() {
+                    player.wake_up().await;
+                }
+            }
 
             Action::StartHorseJump | Action::StopHorseJump | Action::OpenVehicleInventory => {
                 debug!("todo");
@@ -842,13 +846,62 @@ impl JavaClient {
     }
 
     pub async fn handle_move_vehicle(&self, player: &Arc<Player>, packet: SMoveVehicle) {
+        if !player.has_client_loaded() {
+            return;
+        }
+        if !packet.x.is_finite()
+            || !packet.y.is_finite()
+            || !packet.z.is_finite()
+            || !packet.yaw.is_finite()
+            || !packet.pitch.is_finite()
+        {
+            self.kick(TextComponent::translate(
+                translation::MULTIPLAYER_DISCONNECT_INVALID_VEHICLE_MOVEMENT,
+                [],
+            ))
+            .await;
+            return;
+        }
+
         let entity = player.get_entity();
         let vehicle = entity.vehicle.lock().await;
-        if let Some(vehicle) = vehicle.as_ref() {
-            let vehicle_entity = vehicle.get_entity();
-            vehicle_entity.set_pos(Vector3::new(packet.x, packet.y, packet.z));
-            vehicle_entity.set_rotation(packet.yaw, packet.pitch);
+        let Some(vehicle) = vehicle.as_ref() else {
+            return;
+        };
+        let vehicle_entity = vehicle.get_entity();
+
+        // Only the controlling passenger (the first one) may steer the vehicle.
+        let is_controlling = vehicle_entity
+            .passengers
+            .lock()
+            .await
+            .first()
+            .is_some_and(|passenger| passenger.get_entity().entity_id == entity.entity_id);
+        if !is_controlling {
+            return;
         }
+
+        let new_pos = Vector3::new(
+            Self::clamp_horizontal(packet.x),
+            Self::clamp_vertical(packet.y),
+            Self::clamp_horizontal(packet.z),
+        );
+        let old_pos = vehicle_entity.pos.load();
+        // Vanilla: a vehicle moving more than 10 blocks in one packet is "moving too quickly";
+        // ignore the move so a client can't teleport its boat/horse across the map.
+        if new_pos.sub(&old_pos).length_squared() > 100.0 {
+            warn!(
+                "Player {} tried to move a vehicle too quickly ({:?} -> {:?})",
+                player.gameprofile.name, old_pos, new_pos
+            );
+            return;
+        }
+
+        vehicle_entity.set_pos(new_pos);
+        vehicle_entity.set_rotation(
+            wrap_degrees(packet.yaw) % 360.0,
+            wrap_degrees(packet.pitch),
+        );
     }
 
     pub async fn handle_paddle_boat(&self, player: &Arc<Player>, packet: SPaddleBoat) {
@@ -1247,6 +1300,7 @@ impl JavaClient {
         }
     }
 
+    #[expect(clippy::too_many_lines)]
     pub async fn handle_interact(
         &self,
         player: &Arc<Player>,
@@ -1278,6 +1332,19 @@ impl JavaClient {
             .or_else(|| world.get_entity_by_id(entity_id.0));
 
         if let Some(target) = target {
+            // Vanilla: `canInteractWithEntity(aabb, 3.0)`; without this any entity id in the
+            // world could be attacked/mounted/fed from anywhere.
+            if target.get_entity().is_removed() {
+                return;
+            }
+            if !player.can_interact_with_entity(target.get_entity(), 3.0) {
+                warn!(
+                    "Player {0} tried to interact with entity {1} out of reach",
+                    player.gameprofile.name, entity_id.0
+                );
+                return;
+            }
+
             send_cancellable! {{
                 server;
                 PlayerInteractEntityEvent::new(
@@ -1479,7 +1546,6 @@ impl JavaClient {
                     self.update_sequence(player, player_action.sequence.0);
                 }
                 Status::FinishedDigging => {
-                    // TODO: do validation
                     let location = player_action.position;
                     if !player.can_interact_with_block_at(&location, 1.0) {
                         warn!(
@@ -1494,12 +1560,34 @@ impl JavaClient {
                     let entity = &player.living_entity.entity;
                     let world = entity.world.load_full();
 
+                    let was_mining_here = player.mining.load(Ordering::Relaxed)
+                        && *player.mining_pos.lock().await == location;
                     player.mining.store(false, Ordering::Relaxed);
                     world.set_block_breaking(entity, location, -1).await;
 
                     let (block, state) = world.get_block_and_state(&location).await;
-                    let block_drop = player.gamemode.load() != GameMode::Creative
-                        && player.can_harvest(state, block).await;
+                    let is_creative = player.gamemode.load() == GameMode::Creative;
+                    if !is_creative {
+                        // Vanilla only destroys the block once its break progress reached 0.7;
+                        // the client must have started digging this exact block and unbreakable
+                        // blocks (hardness < 0) never make progress.
+                        let speed = block::calc_block_breaking(player, state, block).await;
+                        let elapsed_ticks = player.tick_counter.load(Ordering::Relaxed)
+                            - player.start_mining_time.load(Ordering::Relaxed);
+                        let progress = speed * (elapsed_ticks + 1) as f32;
+                        if state.hardness < 0.0
+                            || (speed < 1.0 && (!was_mining_here || progress < 0.7))
+                        {
+                            warn!(
+                                "Player {0} tried to break a block at {1} without mining it",
+                                player.gameprofile.name, location
+                            );
+                            self.sync_block_state_to_client(&world, location).await;
+                            self.update_sequence(player, player_action.sequence.0);
+                            return;
+                        }
+                    }
+                    let block_drop = !is_creative && player.can_harvest(state, block).await;
 
                     let new_state = world
                         .break_block(
@@ -1607,6 +1695,9 @@ impl JavaClient {
         use_item_on: SUseItemOn,
         server: &Arc<Server>,
     ) -> Result<(), BlockPlacingError> {
+        // Vanilla rejects hit locations further than this from the center of the clicked block
+        const MAX_CURSOR_DISTANCE: f32 = 1.000_000_1;
+
         if !player.has_client_loaded() {
             return Ok(());
         }
@@ -1621,6 +1712,18 @@ impl JavaClient {
         if !player.can_interact_with_block_at(&position, 1.0) {
             // TODO: maybe log?
             return Err(BlockPlacingError::BlockOutOfReach);
+        }
+
+        // This also rejects NaN/infinite cursor positions.
+        if !((cursor_pos.x - 0.5).abs() < MAX_CURSOR_DISTANCE
+            && (cursor_pos.y - 0.5).abs() < MAX_CURSOR_DISTANCE
+            && (cursor_pos.z - 0.5).abs() < MAX_CURSOR_DISTANCE)
+        {
+            warn!(
+                "Rejecting UseItemOn from {0}: cursor position {1:?} too far away from hit block {2}",
+                player.gameprofile.name, cursor_pos, position
+            );
+            return Ok(());
         }
 
         let Ok(face) = BlockDirection::try_from(use_item_on.face.0) else {
@@ -1782,6 +1885,21 @@ impl JavaClient {
         let Some(sign_entity) = block_entity.as_any().downcast_ref::<SignBlockEntity>() else {
             return;
         };
+
+        // Vanilla: only the player the server opened the editor for may write the sign.
+        // Without this check any player can rewrite every sign in loaded chunks.
+        {
+            let mut currently_editing = sign_entity.currently_editing_player.lock().await;
+            if *currently_editing != Some(player.gameprofile.id) {
+                warn!(
+                    "Player {} tried to change a sign at {} they are not editing",
+                    player.gameprofile.name, sign_data.location
+                );
+                return;
+            }
+            *currently_editing = None;
+        }
+
         if sign_entity.is_waxed.load(Ordering::Relaxed) {
             return;
         }
@@ -1793,13 +1911,22 @@ impl JavaClient {
         };
 
         *text.messages.lock().unwrap() = [
-            sign_data.line_1,
-            sign_data.line_2,
-            sign_data.line_3,
-            sign_data.line_4,
+            Self::filter_sign_line(&sign_data.line_1),
+            Self::filter_sign_line(&sign_data.line_2),
+            Self::filter_sign_line(&sign_data.line_3),
+            Self::filter_sign_line(&sign_data.line_4),
         ];
-        *sign_entity.currently_editing_player.lock().await = None;
         world.update_block_entity(&block_entity).await;
+    }
+
+    /// Mirrors vanilla's `StringUtil.filterText`: strips formatting codes and control characters
+    /// and caps the line at the sign line limit.
+    fn filter_sign_line(line: &str) -> String {
+        const MAX_SIGN_LINE_CHARS: usize = 384;
+        line.chars()
+            .filter(|c| *c != '§' && *c >= ' ' && *c != '\x7F')
+            .take(MAX_SIGN_LINE_CHARS)
+            .collect()
     }
 
     pub async fn handle_use_item(
@@ -2310,6 +2437,10 @@ impl JavaClient {
         // Mirror vanilla obstruction checks: only entities that block building should prevent
         // placement. (e.g. arrows/xp orbs/displays/markers should not)
         let state = BlockState::from_id(new_state);
+        if state.is_air() {
+            // The block refused to be placed here: don't place and don't decrement
+            return Ok(false);
+        }
         for shape in state.get_block_collision_shapes() {
             let placed_box = shape.at_pos(final_block_pos);
 

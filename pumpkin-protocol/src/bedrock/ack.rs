@@ -11,13 +11,24 @@ use crate::{
 
 #[packet(0xC0)]
 pub struct Ack {
-    sequences: Vec<u32>,
+    /// Inclusive `(start, end)` sequence number ranges.
+    ///
+    /// Ranges are kept as sent instead of being expanded so that a single
+    /// datagram cannot make the server allocate millions of sequence numbers.
+    ranges: Vec<(u32, u32)>,
 }
 
 impl Ack {
     #[must_use]
-    pub const fn new(sequences: Vec<u32>) -> Self {
-        Self { sequences }
+    pub fn new(sequences: Vec<u32>) -> Self {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for seq in sequences {
+            match ranges.last_mut() {
+                Some((_, end)) if end.checked_add(1) == Some(seq) => *end = seq,
+                _ => ranges.push((seq, seq)),
+            }
+        }
+        Self { ranges }
     }
 
     fn write_range<W: Write>(start: u32, end: u32, writer: &mut W) -> Result<(), Error> {
@@ -41,41 +52,28 @@ impl Ack {
             ));
         }
 
-        let mut sequences = Vec::with_capacity(size as usize);
+        let mut ranges = Vec::with_capacity(size as usize);
         for _ in 0..size {
             let single = bool::read(reader)?;
-            if single {
-                sequences.push(u24::read(reader)?.0);
-            } else {
-                let start = u24::read(reader)?.0;
-                let end = u24::read(reader)?.0;
-                for i in start..end {
-                    sequences.push(i);
-                }
+            let start = u24::read(reader)?.0;
+            let end = if single { start } else { u24::read(reader)?.0 };
+            if end < start {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ACK range ends before it starts.",
+                ));
             }
+            ranges.push((start, end));
         }
-        Ok(Self { sequences })
+        Ok(Self { ranges })
     }
 
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
         0xC0u8.write(writer)?;
-        let mut count: u16 = 0;
-
-        let mut buf = Vec::new();
-
-        let mut start = self.sequences[0];
-        let mut end = start;
-        for seq in self.sequences.iter().copied() {
-            if seq != end + 1 {
-                Self::write_range(start, end, &mut buf)?;
-                count += 1;
-                start = seq;
-            }
-            end = seq;
+        (self.ranges.len() as u16).write_be(writer)?;
+        for &(start, end) in &self.ranges {
+            Self::write_range(start, end, writer)?;
         }
-        Self::write_range(start, end, &mut buf)?;
-        count += 1;
-        count.write_be(writer)?;
-        writer.write_all(&buf)
+        Ok(())
     }
 }

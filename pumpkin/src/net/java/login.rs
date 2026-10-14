@@ -10,7 +10,8 @@ use pumpkin_protocol::{
     },
 };
 use pumpkin_util::text::TextComponent;
-use tracing::debug;
+use std::net::SocketAddr;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -18,7 +19,7 @@ use crate::{
         GameProfile,
         authentication::{self, AuthError},
         is_valid_player_name,
-        java::JavaClient,
+        java::{JavaClient, LoginStage},
         offline_uuid,
         proxy::{bungeecord, velocity},
     },
@@ -28,6 +29,9 @@ use crate::{
 impl JavaClient {
     pub async fn handle_login_start(&self, server: &Server, login_start: SLoginStart) {
         debug!("login start");
+        if !self.expect_login_stage(LoginStage::Hello).await {
+            return;
+        }
 
         // Don't allow new logons when the server is full.
         // If `max_players` is set to zero, then there is no max player count enforced.
@@ -47,12 +51,11 @@ impl JavaClient {
                 .await;
             return;
         }
-        // Default game profile, when no online mode
-        // TODO: Make offline UUID
-        let mut gameprofile = self.gameprofile.lock().await;
+
         let proxy = &server.advanced_config.networking.proxy;
         if proxy.enabled {
             if proxy.velocity.enabled {
+                self.login_stage.store(LoginStage::AwaitingProxyResponse);
                 velocity::velocity_login(self).await;
             } else if proxy.bungeecord.enabled {
                 match bungeecord::bungeecord_login(
@@ -62,46 +65,61 @@ impl JavaClient {
                 )
                 .await
                 {
-                    Ok((_ip, profile)) => {
-                        // self.address.lock() = ip;
-                        self.finish_login(&profile).await;
-                        *gameprofile = Some(profile);
+                    Ok((ip, profile)) => {
+                        // Use the address the proxy forwarded so IP bans and logs see the
+                        // player, not the proxy.
+                        {
+                            let mut address = self.address.lock().await;
+                            *address = SocketAddr::new(ip, address.port());
+                        }
+                        self.complete_login(server, profile).await;
                     }
                     Err(error) => self.kick(TextComponent::text(error.to_string())).await,
                 }
-            }
-        } else {
-            let id = if server.basic_config.online_mode {
-                login_start.uuid
             } else {
-                offline_uuid(&login_start.name).expect("This is very not safe and bad")
-            };
-
-            let profile = GameProfile {
-                id,
-                name: login_start.name,
-                properties: vec![],
-                profile_actions: None,
-            };
-
-            if server.advanced_config.networking.packet_compression.enabled {
-                self.enable_compression(server).await;
-            }
-
-            if server.basic_config.encryption {
-                let verify_token: [u8; 4] = rand::random();
-                // Wait until we have sent the encryption packet to the client
-                self.send_packet_now(
-                    &server
-                        .encryption_request(&verify_token, server.basic_config.online_mode)
-                        .await,
-                )
+                self.kick(TextComponent::text(
+                    "Proxy support is enabled but no proxy type is configured",
+                ))
                 .await;
-            } else {
-                self.finish_login(&profile).await;
             }
+            return;
+        }
 
-            *gameprofile = Some(profile);
+        let id = if server.basic_config.online_mode {
+            // Only a placeholder: the authenticated profile replaces it after the
+            // encryption response.
+            login_start.uuid
+        } else {
+            offline_uuid(&login_start.name).expect("This is very not safe and bad")
+        };
+
+        let profile = GameProfile {
+            id,
+            name: login_start.name,
+            properties: vec![],
+            profile_actions: None,
+        };
+
+        if server.advanced_config.networking.packet_compression.enabled {
+            self.enable_compression(server).await;
+        }
+
+        if server.basic_config.encryption {
+            let verify_token: [u8; 4] = rand::random();
+            *self.verify_token.lock().await = Some(verify_token);
+            // Remember what the client claimed; it is not trusted until the key exchange
+            // (and, in online mode, Mojang) confirmed it.
+            *self.gameprofile.lock().await = Some(profile);
+            self.login_stage.store(LoginStage::AwaitingKey);
+            // Wait until we have sent the encryption packet to the client
+            self.send_packet_now(
+                &server
+                    .encryption_request(&verify_token, server.basic_config.online_mode)
+                    .await,
+            )
+            .await;
+        } else {
+            self.complete_login(server, profile).await;
         }
     }
 
@@ -111,19 +129,40 @@ impl JavaClient {
         encryption_response: SEncryptionResponse,
     ) {
         debug!("Handling encryption");
-        let shared_secret = server
-            .decrypt(&encryption_response.shared_secret)
-            .await
-            .unwrap();
+        if !self.expect_login_stage(LoginStage::AwaitingKey).await {
+            return;
+        }
+
+        let shared_secret = match server.decrypt(&encryption_response.shared_secret).await {
+            Ok(shared_secret) => shared_secret,
+            Err(error) => {
+                self.kick(TextComponent::text(error.to_string())).await;
+                return;
+            }
+        };
+
+        // The client must echo the token from our encryption request, encrypted with our
+        // public key. This binds the response to this connection.
+        let expected_token = self.verify_token.lock().await.take();
+        let token_matches = match (
+            expected_token,
+            server.decrypt(&encryption_response.verify_token).await,
+        ) {
+            (Some(expected), Ok(received)) => received.as_slice() == expected,
+            _ => false,
+        };
+        if !token_matches {
+            self.kick(TextComponent::text("Invalid verify token")).await;
+            return;
+        }
 
         if let Err(error) = self.set_encryption(&shared_secret).await {
             self.kick(TextComponent::text(error.to_string())).await;
             return;
         }
 
-        let mut gameprofile = self.gameprofile.lock().await;
-
-        let Some(profile) = gameprofile.as_mut() else {
+        let claimed_profile = self.gameprofile.lock().await.clone();
+        let Some(mut profile) = claimed_profile else {
             self.kick(TextComponent::text("No `GameProfile`")).await;
             return;
         };
@@ -134,7 +173,7 @@ impl JavaClient {
                 .authenticate(server, &shared_secret, &profile.name)
                 .await
             {
-                Ok(new_profile) => *profile = new_profile,
+                Ok(new_profile) => profile = new_profile,
                 Err(error) => {
                     self.kick(match error {
                         AuthError::FailedResponse => TextComponent::translate(
@@ -148,10 +187,17 @@ impl JavaClient {
                         e => TextComponent::text(e.to_string()),
                     })
                     .await;
+                    return;
                 }
             }
         }
 
+        self.complete_login(server, profile).await;
+    }
+
+    /// Finishes the login with an authenticated profile: rejects duplicate sessions, sends
+    /// `LoginSuccess` and marks the connection as authenticated.
+    async fn complete_login(&self, server: &Server, profile: GameProfile) {
         // Don't allow duplicate UUIDs
         if let Some(online_player) = &server.get_player_by_uuid(profile.id) {
             debug!(
@@ -186,7 +232,10 @@ impl JavaClient {
             return;
         }
 
-        self.finish_login(profile).await;
+        let packet = CLoginSuccess::new(&profile.id, &profile.name, &profile.properties, false);
+        self.send_packet_now(&packet).await;
+        *self.gameprofile.lock().await = Some(profile);
+        self.login_stage.store(LoginStage::Authenticated);
     }
 
     async fn enable_compression(&self, server: &Server) {
@@ -204,11 +253,6 @@ impl JavaClient {
         self.set_compression(compression).await;
     }
 
-    async fn finish_login(&self, profile: &GameProfile) {
-        let packet = CLoginSuccess::new(&profile.id, &profile.name, &profile.properties, false);
-        self.send_packet_now(&packet).await;
-    }
-
     async fn authenticate(
         &self,
         server: &Server,
@@ -217,12 +261,15 @@ impl JavaClient {
     ) -> Result<GameProfile, AuthError> {
         let hash = server.digest_secret(shared_secret).await;
         let ip = self.address.lock().await.ip();
-        let profile = authentication::authenticate(
-            username,
-            &hash,
-            &ip,
-            &server.advanced_config.networking.authentication,
-        )?;
+        let auth_config = server.advanced_config.networking.authentication.clone();
+        let username = username.to_string();
+        // The session server request is blocking I/O; keep it off the async workers so a
+        // slow or rate-limited Mojang can't stall the whole server.
+        let profile = tokio::task::spawn_blocking(move || {
+            authentication::authenticate(&username, &hash, &ip, &auth_config)
+        })
+        .await
+        .map_err(|_| AuthError::FailedResponse)??;
 
         // Check if the player should join
         if let Some(actions) = &profile.profile_actions {
@@ -276,27 +323,46 @@ impl JavaClient {
         plugin_response: SLoginPluginResponse,
     ) {
         debug!("Handling plugin");
+        if !self
+            .expect_login_stage(LoginStage::AwaitingProxyResponse)
+            .await
+        {
+            return;
+        }
         let velocity_config = &server.advanced_config.networking.proxy.velocity;
-        if velocity_config.enabled {
-            let mut address = self.address.lock().await;
-            match velocity::receive_velocity_plugin_response(
-                address.port(),
-                velocity_config,
-                plugin_response,
-            ) {
-                Ok((profile, new_address)) => {
-                    self.finish_login(&profile).await;
-                    *self.gameprofile.lock().await = Some(profile);
-                    *address = new_address;
-                    drop(address);
-                }
-                Err(error) => self.kick(TextComponent::text(error.to_string())).await,
+        if !velocity_config.enabled {
+            self.kick(TextComponent::text("Unexpected login plugin response"))
+                .await;
+            return;
+        }
+        if self.velocity_message_id.load() != Some(plugin_response.message_id.0) {
+            warn!(
+                "Client {} answered a login plugin request we did not send",
+                self.id
+            );
+            self.kick(TextComponent::text("Unexpected login plugin response"))
+                .await;
+            return;
+        }
+
+        let port = self.address.lock().await.port();
+        match velocity::receive_velocity_plugin_response(port, velocity_config, plugin_response) {
+            Ok((profile, new_address)) => {
+                *self.address.lock().await = new_address;
+                self.complete_login(server, profile).await;
             }
+            Err(error) => self.kick(TextComponent::text(error.to_string())).await,
         }
     }
 
     pub async fn handle_login_acknowledged(&self, server: &Server) {
         debug!("Handling login acknowledgement");
+        // Only an authenticated client may enter the configuration phase: this is what
+        // stops a client from skipping the encryption response altogether.
+        if !self.expect_login_stage(LoginStage::Authenticated).await {
+            return;
+        }
+        self.login_stage.store(LoginStage::Configuring);
         self.connection_state.store(ConnectionState::Config);
         self.send_packet_now(&server.get_branding()).await;
 

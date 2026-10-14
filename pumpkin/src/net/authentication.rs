@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::IpAddr};
+use std::{collections::HashMap, net::IpAddr, time::Duration};
 
 use base64::{Engine, engine::general_purpose};
 use pumpkin_config::{AuthenticationConfig, networking::auth::TextureConfig};
@@ -67,6 +67,9 @@ pub fn authenticate(
     ip: &IpAddr,
     auth_config: &AuthenticationConfig,
 ) -> Result<GameProfile, AuthError> {
+    // The username is client supplied: encode it so it can't smuggle extra query parameters
+    // (`&`, `#`, ...) into the request.
+    let username = percent_encode(username);
     let address = if auth_config.prevent_proxy_connections {
         let auth_url = auth_config
             .prevent_proxy_connection_auth_url
@@ -74,7 +77,7 @@ pub fn authenticate(
             .unwrap_or(MOJANG_PREVENT_PROXY_AUTHENTICATION_URL);
 
         auth_url
-            .replace("{username}", username)
+            .replace("{username}", &username)
             .replace("{server_hash}", server_hash)
             .replace("{ip}", &ip.to_string())
     } else {
@@ -84,11 +87,20 @@ pub fn authenticate(
             .unwrap_or(MOJANG_AUTHENTICATION_URL);
 
         auth_url
-            .replace("{username}", username)
+            .replace("{username}", &username)
             .replace("{server_hash}", server_hash)
     };
 
-    let mut response = ureq::get(address)
+    // Bounded timeouts: without them a slow session server pins the calling thread forever.
+    let connect_timeout = Duration::from_millis(u64::from(auth_config.connect_timeout.max(1)));
+    let read_timeout = Duration::from_millis(u64::from(auth_config.read_timeout.max(1)));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(connect_timeout))
+        .timeout_global(Some(connect_timeout + read_timeout))
+        .build()
+        .into();
+    let mut response = agent
+        .get(address)
         .call()
         .map_err(|_| AuthError::FailedResponse)?;
     match response.status() {
@@ -101,6 +113,19 @@ pub fn authenticate(
         .read_json()
         .map_err(|_| AuthError::FailedParse)?;
     Ok(profile)
+}
+
+/// Percent-encodes everything outside the URL "unreserved" set.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 pub fn validate_textures(property: &Property, config: &TextureConfig) -> Result<(), TextureError> {

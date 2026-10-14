@@ -55,6 +55,8 @@ pub enum Error {
     NegativeLength(i32),
     #[error("Length too large: {0}")]
     LargeLength(usize),
+    #[error("NBT nested deeper than {0} levels")]
+    TooDeep(usize),
 }
 
 impl ser::Error for Error {
@@ -210,7 +212,8 @@ mod test {
 
     use std::io::Cursor;
 
-    use crate::Error;
+    use crate::deserializer::{MAX_DEPTH, NbtReadHelper};
+    use crate::{BYTE_ARRAY_ID, COMPOUND_ID, Error, LIST_ID, LONG_ARRAY_ID};
     use crate::compound::NbtCompound;
     use crate::deserializer::from_bytes;
     use crate::nbt_byte_array;
@@ -230,6 +233,60 @@ mod test {
         long: i64,
         float: f32,
         string: String,
+    }
+
+    /// A byte array / long array that declares a huge length but carries no data must fail
+    /// fast instead of allocating gigabytes.
+    #[test]
+    fn huge_declared_array_length_is_an_error() {
+        for (tag_id, name) in [(BYTE_ARRAY_ID, "bytes"), (LONG_ARRAY_ID, "longs")] {
+            // Root compound (unnamed) with one child: `tag_id` named `name`.
+            let mut bytes = vec![COMPOUND_ID, tag_id];
+            bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&i32::MAX.to_be_bytes());
+            bytes.extend_from_slice(&[1, 2, 3]);
+
+            let mut reader = NbtReadHelper::new(Cursor::new(bytes));
+            assert!(NbtTag::deserialize(&mut reader).is_err());
+        }
+    }
+
+    /// Nesting lists beyond MAX_DEPTH must be rejected instead of overflowing the stack.
+    #[test]
+    fn deeply_nested_lists_are_rejected() {
+        // Root compound with one child list `l` whose elements are lists of lists of ...
+        let mut nested = Vec::new();
+        for _ in 0..(MAX_DEPTH + 8) {
+            nested.push(LIST_ID);
+            nested.extend_from_slice(&1i32.to_be_bytes());
+        }
+        let mut unnamed = vec![COMPOUND_ID, LIST_ID, 0, 1, b'l'];
+        unnamed.extend_from_slice(&nested);
+
+        let mut reader = NbtReadHelper::new(Cursor::new(unnamed.clone()));
+        assert!(matches!(
+            NbtTag::deserialize(&mut reader),
+            Err(Error::TooDeep(_))
+        ));
+
+        let mut reader = NbtReadHelper::new(Cursor::new(unnamed[1..].to_vec()));
+        assert!(NbtTag::skip_data(&mut reader, COMPOUND_ID).is_err());
+
+        // The named (serde) entry point has a root name after the compound id.
+        let mut named = vec![COMPOUND_ID, 0, 0, LIST_ID, 0, 1, b'l'];
+        named.extend_from_slice(&nested);
+        let result: Result<NbtCompound, Error> = from_bytes(Cursor::new(named));
+        assert!(result.is_err());
+    }
+
+    /// A list of END tags with a positive length is invalid (and would otherwise spin).
+    #[test]
+    fn end_typed_list_with_elements_is_rejected() {
+        let mut bytes = vec![COMPOUND_ID, LIST_ID, 0, 1, b'l', 0];
+        bytes.extend_from_slice(&i32::MAX.to_be_bytes());
+        let mut reader = NbtReadHelper::new(Cursor::new(bytes));
+        assert!(NbtTag::deserialize(&mut reader).is_err());
     }
 
     #[test]

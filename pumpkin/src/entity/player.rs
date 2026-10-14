@@ -311,6 +311,13 @@ impl ChunkManager {
 
     pub fn handle_acknowledge(&mut self, chunks_per_tick: f32) {
         self.batches_sent_since_ack = BatchState::Count(0);
+        // Vanilla clamps the client's wish to 0.01..=64 so a client can't request the whole
+        // queue in a single tick (or NaN).
+        let chunks_per_tick = if chunks_per_tick.is_finite() {
+            chunks_per_tick.clamp(0.01, 64.0)
+        } else {
+            1.0
+        };
         self.chunks_per_tick = chunks_per_tick.ceil() as usize;
     }
 
@@ -1214,7 +1221,7 @@ impl Player {
         abilities.flying
     }
 
-    fn is_sleeping(&self) -> bool {
+    pub fn is_sleeping(&self) -> bool {
         // TODO: Track sleeping position state explicitly (vanilla checks sleepingPosition.isPresent()).
         self.sleeping_since.load().is_some()
     }
@@ -1288,14 +1295,20 @@ impl Player {
     }
 
     pub async fn wake_up(&self) {
+        // Any client can send `LeaveBed` at any time, so never assume the player is in a bed.
+        if !self.is_sleeping() {
+            return;
+        }
         let world = self.world();
-        let respawn_point = self
-            .respawn_point
-            .load()
-            .expect("Player waking up should have it's respawn point set on the bed.");
 
-        let (bed, bed_state) = world.get_block_and_state_id(&respawn_point.position).await;
-        BedBlock::set_occupied(false, &world, bed, &respawn_point.position, bed_state).await;
+        if let Some(respawn_point) = self.respawn_point.load() {
+            let (bed, bed_state) = world.get_block_and_state_id(&respawn_point.position).await;
+            // The bed may have been broken or replaced while the player was sleeping.
+            if bed.has_tag(&tag::Block::MINECRAFT_BEDS) {
+                BedBlock::set_occupied(false, &world, bed, &respawn_point.position, bed_state)
+                    .await;
+            }
+        }
 
         self.living_entity
             .entity
@@ -1972,6 +1985,25 @@ impl Player {
             y: entity_pos.y + eye_height,
             z: entity_pos.z,
         }) < d * d
+    }
+
+    /// Vanilla `entity_interaction_range` attribute (creative mode adds 2.0).
+    pub fn entity_interaction_range(&self) -> f64 {
+        if self.gamemode.load() == GameMode::Creative {
+            5.0
+        } else {
+            3.0
+        }
+    }
+
+    /// Vanilla `Player#canInteractWithEntity(AABB, double)`.
+    pub fn can_interact_with_entity(&self, target: &Entity, additional_range: f64) -> bool {
+        let d = self.entity_interaction_range() + additional_range;
+        target
+            .bounding_box
+            .load()
+            .squared_magnitude(self.eye_position())
+            < d * d
     }
 
     pub async fn kick(&self, reason: DisconnectReason, message: TextComponent) {

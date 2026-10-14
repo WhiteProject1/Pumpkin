@@ -1,3 +1,7 @@
+use std::io::{Error, ErrorKind, Read};
+
+use crate::serial::PacketRead;
+
 pub mod ack;
 pub mod client;
 pub mod frame_set;
@@ -12,6 +16,23 @@ pub const MTU: usize = 1400;
 pub const RAKNET_MAGIC: [u8; 16] = [
     0x00, 0xff, 0xff, 0x0, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
+
+/// The `RakNet` magic sequence as found in offline packets.
+///
+/// Reading this type fails unless the bytes on the wire equal [`RAKNET_MAGIC`],
+/// so a packet holding it is known to carry a valid magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RakNetMagic;
+
+impl PacketRead for RakNetMagic {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        if <[u8; 16]>::read(reader)? == RAKNET_MAGIC {
+            Ok(Self)
+        } else {
+            Err(Error::new(ErrorKind::InvalidData, "Invalid RakNet magic"))
+        }
+    }
+}
 
 pub const RAKNET_VALID: u8 = 0x80;
 pub const RAKNET_ACK: u8 = 0xC0;

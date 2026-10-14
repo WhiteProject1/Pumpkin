@@ -16,5 +16,9 @@ tokio.workspace = true
 thiserror.workspace = true
 crossbeam-utils.workspace = true
 
+[dev-dependencies]
+# `net` is only needed so `pumpkin-protocol` (which uses `tokio::net`) builds when this crate is tested on its own
+tokio = { workspace = true, features = ["macros", "rt", "net"] }
+
 [lints]
 workspace = true

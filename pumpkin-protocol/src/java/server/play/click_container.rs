@@ -5,6 +5,8 @@ use pumpkin_macros::java_packet;
 use serde::de::SeqAccess;
 use serde::{Deserialize, de};
 
+const MAX_CHANGED_SLOTS: i32 = 128;
+
 #[derive(Debug)]
 #[java_packet(PLAY_CONTAINER_CLICK)]
 pub struct SClickSlot {
@@ -48,7 +50,12 @@ impl<'de> Deserialize<'de> for SClickSlot {
                 let length_of_array = seq
                     .next_element::<VarInt>()?
                     .ok_or(de::Error::custom("Failed to decode VarInt"))?;
-                let mut array_of_changed_slots = vec![];
+                // Vanilla caps the changed-slots map at 128 entries; without the cap one
+                // packet can expand to hundreds of MB.
+                if !(0..=MAX_CHANGED_SLOTS).contains(&length_of_array.0) {
+                    return Err(de::Error::custom("Too many changed slots"));
+                }
+                let mut array_of_changed_slots = Vec::with_capacity(length_of_array.0 as usize);
                 for _ in 0..length_of_array.0 {
                     let slot_number = seq
                         .next_element::<i16>()?
@@ -121,5 +128,47 @@ impl TryFrom<i32> for SlotActionType {
             6 => Ok(Self::PickupAll),
             _ => Err(InvalidSlotActionType),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use serde::Deserialize;
+
+    use super::*;
+    use crate::ser::{NetworkWriteExt, deserializer::Deserializer};
+
+    fn header(changed_slots: i32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.write_var_int(&VarInt(1)).unwrap(); // sync id
+        bytes.write_var_int(&VarInt(0)).unwrap(); // revision
+        bytes.write_i16_be(0).unwrap(); // slot
+        bytes.write_i8(0).unwrap(); // button
+        bytes.write_var_int(&VarInt(0)).unwrap(); // mode: pickup
+        bytes.write_var_int(&VarInt(changed_slots)).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn rejects_too_many_changed_slots() {
+        let bytes = header(MAX_CHANGED_SLOTS + 1);
+        let mut deserializer = Deserializer::new(Cursor::new(bytes));
+        assert!(SClickSlot::deserialize(&mut deserializer).is_err());
+
+        let bytes = header(-1);
+        let mut deserializer = Deserializer::new(Cursor::new(bytes));
+        assert!(SClickSlot::deserialize(&mut deserializer).is_err());
+    }
+
+    #[test]
+    fn parses_a_plain_click() {
+        let mut bytes = header(0);
+        bytes.write_bool(false).unwrap(); // no carried item
+        let mut deserializer = Deserializer::new(Cursor::new(bytes));
+        let packet = SClickSlot::deserialize(&mut deserializer).unwrap();
+        assert_eq!(packet.mode, SlotActionType::Pickup);
+        assert!(packet.array_of_changed_slots.is_empty());
     }
 }

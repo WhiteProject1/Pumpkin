@@ -784,7 +784,9 @@ impl World {
             level_time.send_time(self).await;
 
             for player in self.players.load().iter() {
-                player.wake_up().await;
+                if player.is_sleeping() {
+                    player.wake_up().await;
+                }
             }
 
             if weather.weather_cycle_enabled && (weather.raining || weather.thundering) {

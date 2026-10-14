@@ -19,7 +19,10 @@ use pumpkin_protocol::{
     codec::{bedrock_block_pos::NetworkPos, var_int::VarInt, var_long::VarLong},
     java::client::play::CSystemChatMessage,
 };
-use pumpkin_util::{math::position::BlockPos, text::TextComponent};
+use pumpkin_util::{
+    math::{position::BlockPos, vector3::Vector3},
+    text::TextComponent,
+};
 
 use crate::{
     command::CommandSender,
@@ -31,7 +34,19 @@ use crate::{
 };
 use tracing::{debug, info};
 
+/// Longest chat message or command a client may send, matching the Java limit.
+const MAX_CHAT_LENGTH: usize = 256;
+
 impl BedrockClient {
+    // Same limits the Java handler applies to client-supplied positions
+    const fn clamp_horizontal(pos: f64) -> f64 {
+        pos.clamp(-3.0E7, 3.0E7)
+    }
+
+    const fn clamp_vertical(pos: f64) -> f64 {
+        pos.clamp(-2.0E7, 2.0E7)
+    }
+
     pub async fn handle_request_chunk_radius(
         &self,
         player: &Arc<Player>,
@@ -82,6 +97,19 @@ impl BedrockClient {
             return;
         }
         let new_pos = packet.position.to_f64();
+        if !new_pos.x.is_finite() || !new_pos.y.is_finite() || !new_pos.z.is_finite() {
+            self.kick(
+                DisconnectReason::Kicked,
+                "Invalid player movement".to_string(),
+            )
+            .await;
+            return;
+        }
+        let new_pos = Vector3::new(
+            Self::clamp_horizontal(new_pos.x),
+            Self::clamp_vertical(new_pos.y),
+            Self::clamp_horizontal(new_pos.z),
+        );
         let old_pos = player.position();
 
         if new_pos != old_pos {
@@ -137,6 +165,28 @@ impl BedrockClient {
     }
 
     pub async fn handle_chat_message(&self, server: &Server, player: &Arc<Player>, packet: SText) {
+        // Same checks as the Java `validate_chat_message`
+        if packet.message.len() > MAX_CHAT_LENGTH {
+            self.kick(
+                DisconnectReason::Kicked,
+                "Chat message too long".to_string(),
+            )
+            .await;
+            return;
+        }
+        if packet
+            .message
+            .chars()
+            .any(|c| c == '§' || c < ' ' || c == '\x7F')
+        {
+            self.kick(
+                DisconnectReason::Kicked,
+                "Illegal characters in chat".to_string(),
+            )
+            .await;
+            return;
+        }
+
         let gameprofile = &player.gameprofile;
 
         send_cancellable! {{
@@ -185,6 +235,12 @@ impl BedrockClient {
         server: &Arc<Server>,
         command: SCommandRequest,
     ) {
+        if command.command.len() > MAX_CHAT_LENGTH {
+            self.kick(DisconnectReason::Kicked, "Command too long".to_string())
+                .await;
+            return;
+        }
+
         let player_clone = player.clone();
         let server_clone: Arc<Server> = server.clone();
         send_cancellable! {{

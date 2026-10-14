@@ -15,7 +15,7 @@ use pumpkin_util::{
     GameMode,
     math::{position::BlockPos, vector3::Vector3},
 };
-use pumpkin_world::{inventory::Inventory, item::ItemStack, tick::TickPriority, world::BlockFlags};
+use pumpkin_world::{item::ItemStack, tick::TickPriority, world::BlockFlags};
 
 use crate::world::World;
 
@@ -97,24 +97,45 @@ fn set_waterlogged(block: &Block, state: u16, waterlogged: bool) -> u16 {
     block.from_properties(&props).to_state_id(block)
 }
 
-async fn give_player_bucket_item(player: &Player, item: &'static Item) {
+/// Vanilla `ItemUtils.createFilledResult`: consumes one of the used bucket and gives the player
+/// the resulting bucket.
+async fn give_player_bucket_item(player: &Player, used_item: &Item, result: &'static Item) {
+    let inventory = player.inventory();
     if player.gamemode.load() == GameMode::Creative {
-        for i in 0..player.inventory.main_inventory.len() {
-            if player.inventory.main_inventory[i].lock().await.item.id == item.id {
+        for i in 0..inventory.main_inventory.len() {
+            if inventory.main_inventory[i].lock().await.item.id == result.id {
                 return;
             }
         }
-        let mut item_stack = ItemStack::new(1, item);
-        player
-            .inventory
-            .insert_stack_anywhere(&mut item_stack)
-            .await;
+        let mut item_stack = ItemStack::new(1, result);
+        inventory.insert_stack_anywhere(&mut item_stack).await;
+        return;
+    }
+
+    // Operate on the stack the bucket was actually used from (the main hand is tried first,
+    // like vanilla), so an off-hand bucket never overwrites the main-hand item.
+    let held = inventory.held_item();
+    let used = if held.lock().await.item.id == used_item.id {
+        held
     } else {
-        let item_stack = ItemStack::new(1, item);
-        player
-            .inventory
-            .set_stack(player.inventory.get_selected_slot().into(), item_stack)
-            .await;
+        inventory.off_hand_item().await
+    };
+    let mut used = used.lock().await;
+    if used.item.id != used_item.id {
+        return;
+    }
+    used.decrement(1);
+    if used.is_empty() {
+        *used = ItemStack::new(1, result);
+        return;
+    }
+    drop(used);
+
+    // Buckets stack: the remaining buckets stay in hand and the result goes anywhere else.
+    let mut item_stack = ItemStack::new(1, result);
+    inventory.insert_stack_anywhere(&mut item_stack).await;
+    if !item_stack.is_empty() {
+        player.drop_item(item_stack).await;
     }
 }
 
@@ -284,7 +305,7 @@ async fn try_place_filled_bucket(
 impl ItemBehaviour for EmptyBucketItem {
     fn normal_use<'a>(
         &'a self,
-        _block: &'a Item,
+        item: &'a Item,
         player: &'a Player,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
@@ -310,11 +331,11 @@ impl ItemBehaviour for EmptyBucketItem {
                 return;
             };
 
-            let Some(item) = try_pickup_bucket_item(&world, block_pos, direction).await else {
+            let Some(filled) = try_pickup_bucket_item(&world, block_pos, direction).await else {
                 return;
             };
 
-            give_player_bucket_item(player, item).await;
+            give_player_bucket_item(player, item, filled).await;
         })
     }
 
@@ -354,11 +375,7 @@ impl ItemBehaviour for FilledBucketItem {
 
             //TODO: Spawn entity if applicable
             if player.gamemode.load() != GameMode::Creative {
-                let item_stack = ItemStack::new(1, &Item::BUCKET);
-                player
-                    .inventory
-                    .set_stack(player.inventory.get_selected_slot().into(), item_stack)
-                    .await;
+                give_player_bucket_item(player, item, &Item::BUCKET).await;
             }
         })
     }

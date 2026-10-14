@@ -17,7 +17,9 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Off by default (like vanilla's `enable-query`): it exposes the plugin list,
+            // world name and player names to anyone on the internet.
+            enabled: false,
             address: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 25565),
         }
     }

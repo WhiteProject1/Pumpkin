@@ -219,14 +219,24 @@ impl NbtTag {
                 if len < 0 {
                     return Err(Error::NegativeLength(len));
                 }
+                if tag_type_id == END_ID && len > 0 {
+                    return Err(Error::UnknownTagId(END_ID));
+                }
 
+                reader.enter()?;
                 for _ in 0..len {
                     Self::skip_data(reader, tag_type_id)?;
                 }
+                reader.exit();
 
                 Ok(())
             }
-            COMPOUND_ID => NbtCompound::skip_content(reader),
+            COMPOUND_ID => {
+                reader.enter()?;
+                NbtCompound::skip_content(reader)?;
+                reader.exit();
+                Ok(())
+            }
             INT_ARRAY_ID => {
                 let len = reader.get_i32_be()?;
                 if len < 0 {
@@ -293,17 +303,32 @@ impl NbtTag {
                 if len < 0 {
                     return Err(Error::NegativeLength(len));
                 }
+                if tag_type_id == END_ID && len > 0 {
+                    return Err(Error::UnknownTagId(END_ID));
+                }
 
-                let mut list = Vec::with_capacity(len as usize);
+                // The declared length is untrusted; grow with the data instead.
+                let mut list = Vec::with_capacity(NbtReadHelper::<R>::prealloc_capacity(
+                    len as usize,
+                ));
+                reader.enter()?;
                 for _ in 0..len {
                     let tag = Self::deserialize_data(reader, tag_type_id)?;
-                    assert_eq!(tag.get_type_id(), tag_type_id);
+                    if tag.get_type_id() != tag_type_id {
+                        return Err(Error::UnknownTagId(tag_type_id));
+                    }
                     // Try unwrapping the tag.
                     list.push(Self::flatten(tag));
                 }
+                reader.exit();
                 Ok(Self::List(list))
             }
-            COMPOUND_ID => Ok(Self::Compound(NbtCompound::deserialize_content(reader)?)),
+            COMPOUND_ID => {
+                reader.enter()?;
+                let compound = NbtCompound::deserialize_content(reader)?;
+                reader.exit();
+                Ok(Self::Compound(compound))
+            }
             INT_ARRAY_ID => {
                 let len = reader.get_i32_be()?;
                 if len < 0 {
@@ -311,7 +336,8 @@ impl NbtTag {
                 }
 
                 let len = len as usize;
-                let mut int_array = Vec::with_capacity(len);
+                let mut int_array =
+                    Vec::with_capacity(NbtReadHelper::<R>::prealloc_capacity(len));
                 for _ in 0..len {
                     let int = reader.get_i32_be()?;
                     int_array.push(int);
@@ -325,7 +351,8 @@ impl NbtTag {
                 }
 
                 let len = len as usize;
-                let mut long_array = Vec::with_capacity(len);
+                let mut long_array =
+                    Vec::with_capacity(NbtReadHelper::<R>::prealloc_capacity(len));
                 for _ in 0..len {
                     let long = reader.get_i64_be()?;
                     long_array.push(long);
@@ -449,9 +476,7 @@ impl From<&str> for NbtTag {
 
 impl From<&[u8]> for NbtTag {
     fn from(value: &[u8]) -> Self {
-        let mut cloned = Vec::with_capacity(value.len());
-        cloned.copy_from_slice(value);
-        Self::ByteArray(cloned.into_boxed_slice())
+        Self::ByteArray(value.to_vec().into_boxed_slice())
     }
 }
 

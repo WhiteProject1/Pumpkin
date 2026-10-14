@@ -126,7 +126,7 @@ impl UDPNetworkDecoder {
         mut reader: Cursor<Vec<u8>>,
     ) -> Result<RawPacket, PacketDecodeError> {
         if self.compression.is_some() {
-            let _method = reader.get_u8().unwrap();
+            let _method = reader.get_u8()?;
             // None Compression
         }
 
@@ -159,8 +159,13 @@ impl UDPNetworkDecoder {
         // Gamepacket ID: Remaining 10 bits (bits 4 to 13)
         let gamepacket_id = (header & 0x3FF) as u16; // 0x3FF is 10 bits set to 1
 
+        // The declared length covers the header too; a length shorter than the header is malformed
+        let payload_len = (packet_len as usize)
+            .checked_sub(var_header.written_size())
+            .ok_or(PacketDecodeError::OutOfBounds)?;
+
         let payload = reader
-            .read_boxed_slice(packet_len as usize - var_header.written_size())
+            .read_boxed_slice(payload_len)
             .map_err(|err| PacketDecodeError::FailedDecompression(err.to_string()))?;
 
         Ok(RawPacket {

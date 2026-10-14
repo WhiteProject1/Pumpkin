@@ -17,12 +17,19 @@ use tracing::{error, info};
 
 use crate::{SHOULD_STOP, STOP_INTERRUPT, server::Server};
 
+/// Handshakes are unauthenticated UDP, so the source address is spoofable. Cap how many
+/// outstanding challenge tokens we remember per 30 second window so a flood can't grow the
+/// table without bound.
+const MAX_CHALLENGE_TOKENS: usize = 4096;
+
 pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
-    let socket = Arc::new(
-        UdpSocket::bind(query_addr)
-            .await
-            .expect("Unable to bind to address"),
-    );
+    let socket = match UdpSocket::bind(query_addr).await {
+        Ok(socket) => Arc::new(socket),
+        Err(e) => {
+            error!("Unable to bind query handler to {query_addr}: {e}");
+            return;
+        }
+    };
 
     // Challenge tokens are bound to the IP address and port
     let valid_challenge_tokens = Arc::new(RwLock::new(HashMap::new()));
@@ -61,9 +68,12 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
             () = STOP_INTERRUPT.cancelled() => None,
         };
 
-        let Some(Ok((_, addr))) = recv_result else {
+        let Some(Ok((len, addr))) = recv_result else {
             break;
         };
+        // Only hand the bytes that were actually received to the parser; the zeroed tail
+        // would otherwise make every status request look like a full-stat request.
+        buf.truncate(len);
 
         tokio::spawn(async move {
             if let Err(err) = handle_packet(
@@ -110,7 +120,10 @@ async fn handle_packet(
                         .send_to(response.encode().await.as_slice(), addr)
                         .await;
 
-                    clients.write().await.insert(challenge_token, addr);
+                    let mut clients = clients.write().await;
+                    if clients.len() < MAX_CHALLENGE_TOKENS {
+                        clients.insert(challenge_token, addr);
+                    }
                 }
             }
             PacketType::Status => {
@@ -131,8 +144,8 @@ async fn handle_packet(
                                 // Although there is no documented limit, we will limit to 4 players
                                 .iter()
                                 .take(4 - players.len())
-                                .map(|player| {
-                                    CString::new(player.gameprofile.name.as_str()).unwrap()
+                                .filter_map(|player| {
+                                    CString::new(player.gameprofile.name.as_str()).ok()
                                 })
                                 .collect::<Vec<_>>();
 

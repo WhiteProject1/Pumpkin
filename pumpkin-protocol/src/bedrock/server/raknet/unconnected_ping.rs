@@ -1,6 +1,6 @@
 use pumpkin_macros::packet;
 
-use crate::serial::PacketRead;
+use crate::{bedrock::RakNetMagic, serial::PacketRead};
 
 #[derive(PacketRead)]
 #[packet(0x01)]
@@ -8,7 +8,7 @@ use crate::serial::PacketRead;
 pub struct SUnconnectedPing {
     #[serial(big_endian)]
     pub time: u64,
-    pub magic: [u8; 16],
+    pub magic: RakNetMagic,
     #[serial(big_endian)]
     pub client_guid: u64,
 }

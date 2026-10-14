@@ -25,13 +25,48 @@ pub(super) fn set_curr_visitor_seq_list_id(tag: Option<u8>) {
     });
 }
 
+/// Maximum nesting of lists/compounds we accept (same limit as vanilla).
+pub const MAX_DEPTH: usize = 512;
+
+/// Upper bound for the capacity we pre-allocate from a length read out of the stream. Lengths
+/// are untrusted (they may come from the network or a crafted world file), so collections grow
+/// with the data that actually arrives instead.
+const MAX_PREALLOC_ELEMENTS: usize = 4096;
+
 pub struct NbtReadHelper<R: Read + Seek> {
     reader: R,
+    depth: usize,
 }
 
 impl<R: Read + Seek> NbtReadHelper<R> {
     pub const fn new(r: R) -> Self {
-        Self { reader: r }
+        Self {
+            reader: r,
+            depth: 0,
+        }
+    }
+
+    /// Enters a nested list/compound. Fails once the structure is nested deeper than
+    /// [`MAX_DEPTH`], which would otherwise overflow the stack.
+    pub fn enter(&mut self) -> Result<()> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::TooDeep(MAX_DEPTH));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    pub fn exit(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    #[must_use]
+    pub const fn prealloc_capacity(len: usize) -> usize {
+        if len > MAX_PREALLOC_ELEMENTS {
+            MAX_PREALLOC_ELEMENTS
+        } else {
+            len
+        }
     }
 }
 
@@ -68,10 +103,19 @@ impl<R: Read + Seek> NbtReadHelper<R> {
     define_get_number_be!(get_f64_be, f64);
 
     pub fn read_boxed_slice(&mut self, count: usize) -> Result<Box<[u8]>> {
-        let mut buf = vec![0u8; count];
-        self.reader
-            .read_exact(&mut buf)
+        // Don't allocate `count` bytes up front: the length is untrusted. Read what is
+        // actually there and fail if it falls short.
+        let mut buf = Vec::new();
+        (&mut self.reader)
+            .take(count as u64)
+            .read_to_end(&mut buf)
             .map_err(Error::Incomplete)?;
+        if buf.len() != count {
+            return Err(Error::Incomplete(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("expected {count} bytes but only {} were available", buf.len()),
+            )));
+        }
 
         Ok(buf.into())
     }
@@ -88,7 +132,7 @@ pub struct Deserializer<R: Read + Seek> {
 impl<R: Read + Seek> Deserializer<R> {
     pub const fn new(input: R, is_named: bool) -> Self {
         Self {
-            input: NbtReadHelper { reader: input },
+            input: NbtReadHelper::new(input),
             tag_to_deserialize_stack: None,
             in_list: false,
             is_named,
@@ -149,18 +193,30 @@ impl<'de, R: Read + Seek> de::Deserializer<'de> for &mut Deserializer<R> {
                 if remaining_values < 0 {
                     return Err(Error::NegativeLength(remaining_values));
                 }
+                if list_type == END_ID && remaining_values > 0 {
+                    return Err(Error::SerdeError(
+                        "List with elements has no element type".to_string(),
+                    ));
+                }
 
                 //TODO this is a bit hacky but I couldn't think of a better way
                 // This flag gets auto cleared in visit_seq
                 set_curr_visitor_seq_list_id(Some(list_type));
+                self.input.enter()?;
                 let result = visitor.visit_seq(ListAccess {
                     de: self,
                     list_type,
                     remaining_values: remaining_values as usize,
-                })?;
-                Ok(result)
+                });
+                self.input.exit();
+                result
             }
-            COMPOUND_ID => visitor.visit_map(CompoundAccess { de: self }),
+            COMPOUND_ID => {
+                self.input.enter()?;
+                let result = visitor.visit_map(CompoundAccess { de: self });
+                self.input.exit();
+                result
+            }
             _ => {
                 let result = match NbtTag::deserialize_data(&mut self.input, tag_to_deserialize)? {
                     NbtTag::Byte(value) => visitor.visit_i8::<Error>(value)?,
@@ -204,7 +260,12 @@ impl<'de, R: Read + Seek> de::Deserializer<'de> for &mut Deserializer<R> {
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        if self.tag_to_deserialize_stack.unwrap() == BYTE_ID {
+        let Some(tag) = self.tag_to_deserialize_stack else {
+            return Err(Error::SerdeError(
+                "The top level must be a component (e.g. a struct)".to_string(),
+            ));
+        };
+        if tag == BYTE_ID {
             let value = self.input.get_u8_be()?;
             if value != 0 {
                 return visitor.visit_bool(true);
@@ -248,8 +309,10 @@ impl<'de, R: Read + Seek> de::Deserializer<'de> for &mut Deserializer<R> {
             }
         }
 
-        let value = visitor.visit_map(CompoundAccess { de: self })?;
-        Ok(value)
+        self.input.enter()?;
+        let value = visitor.visit_map(CompoundAccess { de: self });
+        self.input.exit();
+        value
     }
 
     fn deserialize_struct<V: Visitor<'de>>(

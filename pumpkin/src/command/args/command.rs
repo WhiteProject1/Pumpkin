@@ -51,22 +51,24 @@ impl ArgumentConsumer for CommandTreeArgumentConsumer {
 
     fn suggest<'a>(
         &'a self,
-        _sender: &CommandSender,
+        sender: &CommandSender,
         server: &'a Server,
         input: &'a str,
     ) -> SuggestResult<'a> {
+        let sender = sender.clone();
         Box::pin(async move {
             let Some(input) = input.split_single_whitespace_including_empty_parts().last() else {
                 return Ok(None);
             };
 
             let dispatcher = server.command_dispatcher.read().await;
-            let suggestions = dispatcher
-                .commands
-                .keys()
-                .filter(|suggestion| suggestion.starts_with(input))
-                .map(|suggestion| CommandSuggestion::new(suggestion.clone(), None))
-                .collect();
+            // Only suggest commands the sender is allowed to run
+            let mut suggestions = Vec::new();
+            for key in dispatcher.commands.keys() {
+                if key.starts_with(input) && dispatcher.can_use(&sender, server, key).await {
+                    suggestions.push(CommandSuggestion::new(key.clone(), None));
+                }
+            }
             Ok(Some(suggestions))
         })
     }

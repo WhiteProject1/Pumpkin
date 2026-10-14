@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use pumpkin_protocol::java::client::play::{ArgumentType, SuggestionProviders};
+use pumpkin_util::permission::PermissionLvl;
 
 use crate::command::CommandSender;
 use crate::command::args::ConsumeResult;
@@ -40,6 +41,11 @@ impl ArgumentConsumer for PlayersArgumentConsumer {
         let Some(s) = s_opt else {
             return Box::pin(async move { None });
         };
+
+        // Target selectors require permission level 2, like in vanilla
+        if s.starts_with('@') && !sender.has_permission_lvl(PermissionLvl::Two) {
+            return Box::pin(async move { None });
+        }
 
         let sync_result: Option<Vec<Arc<Player>>> = match s {
             "@s" => match sender {

@@ -21,13 +21,15 @@ impl DataComponentCodec<Self> for MaxStackSizeImpl {
         seq.serialize_field::<VarInt>("", &VarInt::from(self.size))
     }
     fn deserialize<'a, A: SeqAccess<'a>>(seq: &mut A) -> Result<Self, A::Error> {
-        let size = u8::try_from(
-            seq.next_element::<VarInt>()?
-                .ok_or(de::Error::custom("No MaxStackSize VarInt!"))?
-                .0,
-        )
-        .map_err(|_| de::Error::custom("No MaxStackSize VarInt!"))?;
-        Ok(Self { size })
+        let size = seq
+            .next_element::<VarInt>()?
+            .ok_or(de::Error::custom("No MaxStackSize VarInt!"))?
+            .0;
+        // Vanilla: `ExtraCodecs.intRange(1, 99)`
+        if !(1..=99).contains(&size) {
+            return Err(de::Error::custom("MaxStackSize out of range"));
+        }
+        Ok(Self { size: size as u8 })
     }
 }
 
@@ -40,6 +42,9 @@ impl DataComponentCodec<Self> for DamageImpl {
             .next_element::<VarInt>()?
             .ok_or(de::Error::custom("No damage VarInt!"))?
             .0;
+        if damage < 0 {
+            return Err(de::Error::custom("Negative damage"));
+        }
         Ok(Self { damage })
     }
 }
@@ -68,11 +73,18 @@ impl DataComponentCodec<Self> for EnchantmentsImpl {
             let id = seq
                 .next_element::<VarInt>()?
                 .ok_or(de::Error::custom("No EnchantmentsImpl id VarInt!"))?
-                .0 as u8;
+                .0;
+            let id = u8::try_from(id).map_err(|_| {
+                de::Error::custom("EnchantmentsImpl Enchantment VarInt Incorrect!")
+            })?;
             let level = seq
                 .next_element::<VarInt>()?
                 .ok_or(de::Error::custom("No EnchantmentsImpl level VarInt!"))?
                 .0;
+            // Vanilla's enchantment codec limit
+            if !(0..=255).contains(&level) {
+                return Err(de::Error::custom("Enchantment level out of range"));
+            }
             enc.push((
                 Enchantment::from_id(id).ok_or(de::Error::custom(
                     "EnchantmentsImpl Enchantment VarInt Incorrect!",
@@ -198,13 +210,17 @@ impl DataComponentCodec<Self> for PotionContentsImpl {
                 .next_element::<bool>()?
                 .ok_or(de::Error::custom("No show_icon bool!"))?;
 
-            // Hidden effect (optional, recursive) - we skip it for now
+            // Hidden effect (optional, nested) - we skip it for now
             let has_hidden = seq
                 .next_element::<bool>()?
                 .ok_or(de::Error::custom("No has_hidden bool!"))?;
             if has_hidden {
-                // Skip hidden effect parameters recursively
+                // Skip hidden effect parameters
                 skip_effect_parameters(seq)?;
+            }
+
+            if !(0..=MAX_AMPLIFIER).contains(&amplifier) || duration < -1 {
+                return Err(de::Error::custom("Potion effect out of range"));
             }
 
             custom_effects.push(StatusEffectInstance {
@@ -237,31 +253,39 @@ impl DataComponentCodec<Self> for PotionContentsImpl {
     }
 }
 
-/// Helper to skip hidden effect parameters recursively
+/// Vanilla's `MobEffectInstance` codec limit.
+const MAX_AMPLIFIER: i32 = 255;
+/// How deep a chain of hidden effects may nest. Each level is only 6 bytes on the wire, so
+/// without a cap a single packet could nest millions of levels and overflow the stack.
+const MAX_HIDDEN_EFFECT_DEPTH: usize = 16;
+
+/// Helper to skip (nested) hidden effect parameters
 fn skip_effect_parameters<'a, A: SeqAccess<'a>>(seq: &mut A) -> Result<(), A::Error> {
-    // amplifier
-    seq.next_element::<VarInt>()?
-        .ok_or(de::Error::custom("No hidden amplifier VarInt!"))?;
-    // duration
-    seq.next_element::<VarInt>()?
-        .ok_or(de::Error::custom("No hidden duration VarInt!"))?;
-    // ambient
-    seq.next_element::<bool>()?
-        .ok_or(de::Error::custom("No hidden ambient bool!"))?;
-    // show_particles
-    seq.next_element::<bool>()?
-        .ok_or(de::Error::custom("No hidden show_particles bool!"))?;
-    // show_icon
-    seq.next_element::<bool>()?
-        .ok_or(de::Error::custom("No hidden show_icon bool!"))?;
-    // has_hidden (recursive)
-    let has_hidden = seq
-        .next_element::<bool>()?
-        .ok_or(de::Error::custom("No hidden has_hidden bool!"))?;
-    if has_hidden {
-        skip_effect_parameters(seq)?;
+    for _ in 0..MAX_HIDDEN_EFFECT_DEPTH {
+        // amplifier
+        seq.next_element::<VarInt>()?
+            .ok_or(de::Error::custom("No hidden amplifier VarInt!"))?;
+        // duration
+        seq.next_element::<VarInt>()?
+            .ok_or(de::Error::custom("No hidden duration VarInt!"))?;
+        // ambient
+        seq.next_element::<bool>()?
+            .ok_or(de::Error::custom("No hidden ambient bool!"))?;
+        // show_particles
+        seq.next_element::<bool>()?
+            .ok_or(de::Error::custom("No hidden show_particles bool!"))?;
+        // show_icon
+        seq.next_element::<bool>()?
+            .ok_or(de::Error::custom("No hidden show_icon bool!"))?;
+        // has_hidden (nested)
+        let has_hidden = seq
+            .next_element::<bool>()?
+            .ok_or(de::Error::custom("No hidden has_hidden bool!"))?;
+        if !has_hidden {
+            return Ok(());
+        }
     }
-    Ok(())
+    Err(de::Error::custom("Hidden effects nested too deep"))
 }
 
 impl DataComponentCodec<Self> for FireworkExplosionImpl {

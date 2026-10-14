@@ -26,9 +26,10 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut Deserializer<R> {
     type Error = ReadingError;
 
     fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        unimplemented!(
-            "This is impossible to do, since you cannot infer the data structure from the packet"
-        )
+        // Impossible: the data structure cannot be inferred from the packet bytes.
+        Err(ReadingError::Message(
+            "deserialize_any is not supported for packets".to_string(),
+        ))
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -104,11 +105,15 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut Deserializer<R> {
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        unimplemented!()
+        Err(ReadingError::Message(
+            "deserialize_bytes is not supported for packets".to_string(),
+        ))
     }
 
     fn deserialize_byte_buf<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        unimplemented!()
+        Err(ReadingError::Message(
+            "deserialize_byte_buf is not supported for packets".to_string(),
+        ))
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -136,7 +141,9 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut Deserializer<R> {
         _name: &'static str,
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        unimplemented!()
+        Err(ReadingError::Message(
+            "deserialize_newtype_struct is not supported for packets".to_string(),
+        ))
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -227,7 +234,14 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut Deserializer<R> {
                 seed.deserialize(&mut *self.deserializer)
             }
         }
+        const MAX_MAP_SIZE: usize = 65536;
+
         let len = self.inner.get_var_int()?.0 as usize;
+        if len > MAX_MAP_SIZE {
+            return Err(ReadingError::TooLarge(format!(
+                "Map length {len} exceeds limit"
+            )));
+        }
 
         visitor.visit_map(Access {
             deserializer: self,
@@ -254,14 +268,18 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut Deserializer<R> {
     }
 
     fn deserialize_identifier<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        unimplemented!()
+        Err(ReadingError::Message(
+            "deserialize_identifier is not supported for packets".to_string(),
+        ))
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(
         self,
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        unimplemented!()
+        Err(ReadingError::Message(
+            "deserialize_ignored_any is not supported for packets".to_string(),
+        ))
     }
 }
 

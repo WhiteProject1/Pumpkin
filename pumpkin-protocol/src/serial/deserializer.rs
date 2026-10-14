@@ -1,5 +1,5 @@
 use std::{
-    io::{Error, Read},
+    io::{Error, ErrorKind, Read},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
@@ -7,6 +7,10 @@ use pumpkin_util::math::{vector2::Vector2, vector3::Vector3};
 use uuid::Uuid;
 
 use crate::{codec::var_uint::VarUInt, serial::PacketRead};
+
+/// Largest byte array / string a single Bedrock packet may carry. The length prefix is client
+/// controlled, so it must never be trusted for allocation on its own.
+pub const MAX_BYTES_LEN: usize = 2 * 1024 * 1024;
 
 impl PacketRead for bool {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
@@ -122,35 +126,44 @@ impl PacketRead for f64 {
 
 impl<T: PacketRead, const N: usize> PacketRead for [T; N] {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
-        #[expect(clippy::uninit_assumed_init)]
-        let mut buf: [T; N] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        for i in &mut buf {
-            *i = T::read(reader)?;
+        // Read into a Vec first so a failure part way through never leaves (or drops)
+        // uninitialized elements.
+        let mut items = Vec::with_capacity(N);
+        for _ in 0..N {
+            items.push(T::read(reader)?);
         }
-        Ok(buf)
+        items
+            .try_into()
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "array length mismatch"))
     }
 }
 
 impl PacketRead for String {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let vec = Vec::read(reader)?;
-        Ok(unsafe { Self::from_utf8_unchecked(vec) })
+        Self::from_utf8(vec).map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
     }
 }
 
 impl PacketRead for Vec<u8> {
-    #[expect(clippy::read_zero_byte_vec)]
     fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
-        #[expect(clippy::uninit_vec)]
-        {
-            let len = VarUInt::read(reader)?.0 as _;
-            let mut buf = Self::with_capacity(len);
-            unsafe {
-                buf.set_len(len);
-            };
-            reader.read_exact(&mut buf)?;
-            Ok(buf)
+        let len = VarUInt::read(reader)?.0 as usize;
+        if len > MAX_BYTES_LEN {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("byte array length {len} exceeds {MAX_BYTES_LEN}"),
+            ));
         }
+        // Grow with the data that actually arrives instead of trusting the declared length.
+        let mut buf = Self::new();
+        reader.take(len as u64).read_to_end(&mut buf)?;
+        if buf.len() != len {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("expected {len} bytes but only {} were available", buf.len()),
+            ));
+        }
+        Ok(buf)
     }
 }
 
@@ -211,5 +224,53 @@ impl PacketRead for Uuid {
 impl<T: PacketRead> PacketRead for Option<T> {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
         bool::read(reader)?.then(|| T::read(reader)).transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::serial::{PacketRead, PacketWrite};
+
+    use super::MAX_BYTES_LEN;
+
+    #[test]
+    fn byte_vec_rejects_huge_declared_length() {
+        // VarUInt(u32::MAX) followed by nothing: must error, must not allocate 4 GiB.
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        assert!(Vec::<u8>::read(&mut Cursor::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn byte_vec_rejects_truncated_payload() {
+        let mut bytes = Vec::new();
+        crate::codec::var_uint::VarUInt(10).write(&mut bytes).unwrap();
+        bytes.extend_from_slice(&[1, 2, 3]);
+        assert!(Vec::<u8>::read(&mut Cursor::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn string_rejects_invalid_utf8() {
+        let mut bytes = Vec::new();
+        crate::codec::var_uint::VarUInt(2).write(&mut bytes).unwrap();
+        bytes.extend_from_slice(&[0xC3, 0x28]);
+        assert!(String::read(&mut Cursor::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn string_roundtrip() {
+        let mut bytes = Vec::new();
+        "héllo".to_string().write(&mut bytes).unwrap();
+        assert_eq!(String::read(&mut Cursor::new(bytes)).unwrap(), "héllo");
+        assert!(MAX_BYTES_LEN > 0);
+    }
+
+    #[test]
+    fn fixed_array_short_read_is_an_error() {
+        let bytes = [1u8, 2, 3];
+        assert!(<[u8; 16]>::read(&mut Cursor::new(bytes)).is_err());
+        let bytes = [1u8, 2, 3, 4];
+        assert_eq!(<[u8; 4]>::read(&mut Cursor::new(bytes)).unwrap(), [1, 2, 3, 4]);
     }
 }

@@ -538,9 +538,11 @@ impl Level {
 
         let recv = self.chunk_listener.add_single_chunk_listener(pos);
 
+        // A full-level ticket only generates this chunk (plus the neighbours the Full stage
+        // depends on); a lower level would spread generation across a large radius.
         {
             let mut lock = self.chunk_loading.lock().unwrap();
-            lock.add_ticket(pos, 31);
+            lock.add_ticket(pos, ChunkLoading::FULL_CHUNK_LEVEL);
             lock.send_change();
         };
 
@@ -553,7 +555,7 @@ impl Level {
 
         {
             let mut lock = self.chunk_loading.lock().unwrap();
-            lock.remove_ticket(pos, 31);
+            lock.remove_ticket(pos, ChunkLoading::FULL_CHUNK_LEVEL);
             lock.send_change();
         };
 

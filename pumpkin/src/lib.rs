@@ -222,7 +222,9 @@ impl PumpkinServer {
             );
             let rcon_server = server.clone();
             server.spawn_task(async move {
-                RCONServer::run(&rcon, rcon_server).await.unwrap();
+                if let Err(e) = RCONServer::run(&rcon, rcon_server).await {
+                    error!("RCON server stopped: {e}");
+                }
             });
         }
 
@@ -419,6 +421,11 @@ impl PumpkinServer {
                                      java_client.await_tasks().await;
                                 },
                                 PacketHandlerResult::ReadyToPlay(profile,config) => {
+                                     // A client kicked during the last configuration step must not be spawned.
+                                     if java_client.is_closed() {
+                                         java_client.await_tasks().await;
+                                         return;
+                                     }
                                      if let Some((player, world)) = server_clone
                                      .add_player(ClientPlatform::Java(java_client), profile, Some(config))
                                           .await
@@ -473,7 +480,11 @@ impl PumpkinServer {
                                     tasks.spawn(async move {
                                         client.process_packet(&server, reader).await;
                                     });
-                                } else if let Ok(packet) = BedrockClient::is_connection_request(&mut Cursor::new(&udp_buf[4..len])) {
+                                } else if clients_guard.len() >= BedrockClient::MAX_CLIENTS {
+                                    debug!("Refusing new Bedrock connection from {client_addr}: client limit reached");
+                                } else if let Some(data) = udp_buf.get(4..len)
+                                    && let Ok(packet) = BedrockClient::is_connection_request(&mut Cursor::new(data))
+                                {
                                     *master_client_id_counter += 1;
 
                                     let mut platform = BedrockClient::new(self.udp_socket.clone().unwrap(), client_addr, be_clients);

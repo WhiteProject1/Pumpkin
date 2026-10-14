@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io::Write, sync::Arc};
 
 use bytes::Bytes;
 use crossbeam::atomic::AtomicCell;
 use pumpkin_config::networking::compression::CompressionInfo;
 use pumpkin_data::packet::CURRENT_MC_VERSION;
+use pumpkin_data::translation;
 use pumpkin_protocol::java::server::play::{
     SChangeGameMode, SChatCommand, SChatMessage, SChunkBatch, SClickSlot, SClientCommand,
     SClientInformationPlay, SClientTickEnd, SCloseContainer, SCommandSuggestion, SConfirmTeleport,
@@ -66,11 +68,39 @@ use crate::net::{GameProfile, PlayerConfig};
 use crate::plugin::player::player_custom_payload::PlayerCustomPayloadEvent;
 use crate::{error::PumpkinError, net::EncryptionError, server::Server};
 
+/// Where a connection is in the login handshake. Every login/config packet is only accepted in
+/// the stage that expects it, so a client can't skip authentication (e.g. by never answering
+/// the encryption request) or replay a stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginStage {
+    /// Waiting for `LoginStart`.
+    Hello,
+    /// The encryption request was sent; waiting for the client's shared secret.
+    AwaitingKey,
+    /// The Velocity plugin request was sent; waiting for the forwarded profile.
+    AwaitingProxyResponse,
+    /// `LoginSuccess` was sent; the game profile is authenticated.
+    Authenticated,
+    /// Login was acknowledged; the configuration phase is running.
+    Configuring,
+    /// `FinishConfiguration` was sent; waiting for the acknowledgement.
+    FinishingConfig,
+}
+
 pub struct JavaClient {
     pub id: u64,
     pub version: AtomicCell<MinecraftVersion>,
-    /// The client's game profile information.
+    /// The client's game profile information. Only trustworthy once `login_stage` is at least
+    /// [`LoginStage::Authenticated`].
     pub gameprofile: Mutex<Option<GameProfile>>,
+    /// The current login stage, see [`LoginStage`].
+    pub login_stage: AtomicCell<LoginStage>,
+    /// The verify token sent with the encryption request; the client must echo it back.
+    pub verify_token: Mutex<Option<[u8; 4]>>,
+    /// The transaction id of the Velocity plugin request we sent, if any.
+    pub velocity_message_id: AtomicCell<Option<i32>>,
+    /// Whether a status request was already answered on this connection.
+    status_requested: AtomicBool,
     /// The client's configuration settings, Optional
     pub config: Mutex<Option<PlayerConfig>>,
     /// The Address used to connect to the Server, Send in the Handshake
@@ -127,6 +157,10 @@ impl OutgoingPacket {
 }
 
 impl JavaClient {
+    /// How long we wait for the next packet while a connection is still in the handshake,
+    /// status, login or config state. Vanilla disconnects after 30 seconds with `slow_login`.
+    const PRE_PLAY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     #[must_use]
     pub fn new(tcp_stream: TcpStream, address: SocketAddr, id: u64) -> Self {
         let (read, write) = tcp_stream.into_split();
@@ -135,6 +169,10 @@ impl JavaClient {
         Self {
             id,
             gameprofile: Mutex::new(None),
+            login_stage: AtomicCell::new(LoginStage::Hello),
+            verify_token: Mutex::new(None),
+            velocity_message_id: AtomicCell::new(None),
+            status_requested: AtomicBool::new(false),
             config: Mutex::new(None),
             server_address: Mutex::new(String::new()),
             address: Mutex::new(address),
@@ -193,10 +231,39 @@ impl JavaClient {
     ///
     /// * `server`: A reference to the `Server` instance.
     pub async fn handle_login_sequence(&self, server: &Arc<Server>) -> PacketHandlerResult {
-        while let Some(packet) = self.get_packet().await {
+        loop {
+            // Once kicked, nothing the client pipelined behind the offending packet may still be
+            // handled (it could otherwise finish a login that was just rejected).
+            if self.is_closed() {
+                break;
+            }
+            // A client that connects and then goes quiet must not be able to hold the
+            // connection (and its task/buffers) open forever before it is a player.
+            let packet =
+                match tokio::time::timeout(Self::PRE_PLAY_READ_TIMEOUT, self.get_packet()).await {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => break,
+                    Err(_) => {
+                        debug!(
+                            "Client {} took too long to log in (state {:?})",
+                            self.id,
+                            self.connection_state.load()
+                        );
+                        self.kick(TextComponent::translate(
+                            translation::MULTIPLAYER_DISCONNECT_SLOW_LOGIN,
+                            [],
+                        ))
+                        .await;
+                        break;
+                    }
+                };
             match self.handle_packet(server, &packet).await {
                 Ok(result) => {
                     if let Some(result) = result {
+                        if self.is_closed() {
+                            // Kicked while finishing the configuration, e.g. by a join check.
+                            break;
+                        }
                         return result;
                     }
                 }
@@ -207,10 +274,26 @@ impl JavaClient {
                         packet.id, error
                     );
                     self.kick(TextComponent::text(text)).await;
+                    break;
                 }
             }
         }
         PacketHandlerResult::Stop
+    }
+
+    /// Kicks the client when it is not in the expected login stage; returns whether it was.
+    pub async fn expect_login_stage(&self, expected: LoginStage) -> bool {
+        let stage = self.login_stage.load();
+        if stage == expected {
+            return true;
+        }
+        debug!(
+            "Client {} sent a packet for login stage {expected:?} while in stage {stage:?}",
+            self.id
+        );
+        self.kick(TextComponent::text("Unexpected packet for the current login stage"))
+            .await;
+        false
     }
 
     pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {
@@ -259,7 +342,16 @@ impl JavaClient {
     pub async fn enqueue_packet<P: ClientPacket>(&self, packet: &P) {
         let mut buf = Vec::new();
         let writer = &mut buf;
-        self.write_packet(packet, writer).unwrap();
+        // Serialization can fail on oversized content (e.g. a text component above the NBT
+        // string limit). That must never take the whole server down; drop the packet instead.
+        if let Err(err) = self.write_packet(packet, writer) {
+            error!(
+                "Failed to serialize packet {} for client {}: {err}",
+                P::to_id(self.version.load()),
+                self.id
+            );
+            return;
+        }
         self.enqueue_packet_data(buf.into()).await;
     }
 
@@ -292,6 +384,8 @@ impl JavaClient {
     pub async fn get_packet(&self) -> Option<RawPacket> {
         let mut network_reader = self.network_reader.lock().await;
         tokio::select! {
+            // Always prefer the close signal: after a kick no further packet may be processed.
+            biased;
             () = self.await_close_interrupt() => {
                 debug!("Canceling player packet processing");
                 None
@@ -335,7 +429,14 @@ impl JavaClient {
     pub async fn send_packet_now<P: ClientPacket>(&self, packet: &P) {
         let mut packet_buf = Vec::new();
         let writer = &mut packet_buf;
-        self.write_packet(packet, writer).unwrap();
+        if let Err(err) = self.write_packet(packet, writer) {
+            error!(
+                "Failed to serialize packet {} for client {}: {err}",
+                P::to_id(self.version.load()),
+                self.id
+            );
+            return;
+        }
         self.send_packet_now_data(packet_buf.into()).await;
     }
 
@@ -470,6 +571,11 @@ impl JavaClient {
 
         match packet.id {
             id if id == SStatusRequest::to_id(version) => {
+                // Vanilla closes the connection on a second status request.
+                if self.status_requested.swap(true, Ordering::Relaxed) {
+                    self.close();
+                    return Ok(None);
+                }
                 self.handle_status_request(server).await;
                 Ok(None)
             }
@@ -615,10 +721,10 @@ impl JavaClient {
                 self.handle_login_cookie_response(&SLoginCookieResponse::read(payload, &version)?);
             }
             _ => {
-                error!(
+                return Err(ReadingError::Message(format!(
                     "Failed to handle java client packet id {} in Login State",
                     packet.id
-                );
+                )));
             }
         }
         Ok(None)
@@ -664,10 +770,10 @@ impl JavaClient {
                 .await;
             }
             _ => {
-                error!(
+                return Err(ReadingError::Message(format!(
                     "Failed to handle java client packet id {} in Config State",
                     packet.id
-                );
+                )));
             }
         }
         Ok(None)

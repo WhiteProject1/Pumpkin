@@ -357,12 +357,16 @@ impl Slot for ResultSlot {
                 let mut stack = slot.lock().await;
                 if !stack.is_empty() {
                     //TODO: Handle remaining items.
-                    stack.item_count -= 1;
+                    stack.decrement(1);
                 }
             }
             // TODO
             //self.stat_crafted(stack.item_count, player);
             self.mark_dirty().await;
+            // The ingredients changed, so the result has to be recomputed right away.
+            // Otherwise `take_stack` (which returns the full result without consuming it)
+            // keeps handing out the stale result until the listener runs.
+            self.refill_output().await;
         })
     }
 

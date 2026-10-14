@@ -11,6 +11,7 @@ use pumpkin_data::entity::EntityType;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::java::client::play::{ArgumentType, SuggestionProviders};
 use pumpkin_util::GameMode;
+use pumpkin_util::permission::PermissionLvl;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -117,7 +118,7 @@ impl FromStr for EntityFilter {
                 }
                 Ok(Self::Sort(sort))
             }
-            _ => todo!("{key}"),
+            _ => Err(format!("Unsupported selector argument '{key}'")),
         }
     }
 }
@@ -262,6 +263,11 @@ impl ArgumentConsumer for EntitiesArgumentConsumer {
         let Some(s) = s_opt else {
             return Box::pin(async move { None });
         };
+
+        // Target selectors require permission level 2, like in vanilla
+        if s.starts_with('@') && !sender.has_permission_lvl(PermissionLvl::Two) {
+            return Box::pin(async move { None });
+        }
 
         let entity_selector = match s.parse::<TargetSelector>() {
             Ok(selector) => selector,

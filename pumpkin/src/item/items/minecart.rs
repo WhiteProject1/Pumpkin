@@ -83,6 +83,7 @@ impl ItemBehaviour for MinecartItem {
                 entity_type,
             ));
             world.spawn_entity(entity).await;
+            item.decrement_unless_creative(player.gamemode.load(), 1);
         })
     }
 

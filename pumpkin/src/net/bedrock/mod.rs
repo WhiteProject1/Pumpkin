@@ -61,11 +61,19 @@ pub mod open_connection;
 pub mod unconnected;
 use crate::{entity::player::Player, net::DisconnectReason, server::Server};
 
+/// Maximum number of fragments a single split packet may consist of.
+/// Legitimate packets (e.g. the login chain) need far fewer than this.
+const MAX_SPLIT_COUNT: u32 = 512;
+/// Maximum number of partially received split packets kept per client.
+const MAX_COMPOUNDS: usize = 16;
+
 pub struct BedrockClient {
     socket: Arc<UdpSocket>,
     /// The client's IP address.
     pub address: SocketAddr,
     pub player: Mutex<Option<Arc<Player>>>,
+    /// Set once the first `SLogin` packet has been received; any further one is rejected.
+    pub login_started: AtomicBool,
     /// All Bedrock clients
     /// This list is used to remove the client if the connection gets closed
     pub be_clients: Arc<Mutex<HashMap<SocketAddr, Arc<Self>>>>,
@@ -94,6 +102,10 @@ pub struct BedrockClient {
 }
 
 impl BedrockClient {
+    /// Maximum number of concurrently connected Bedrock clients.
+    /// Any address can open a connection with a single datagram, so the table has to be bounded.
+    pub const MAX_CLIENTS: usize = 1024;
+
     #[must_use]
     pub fn new(
         socket: Arc<UdpSocket>,
@@ -104,6 +116,7 @@ impl BedrockClient {
         Self {
             socket,
             player: Mutex::new(None),
+            login_started: AtomicBool::new(false),
             address,
             be_clients,
             network_writer: Arc::new(Mutex::new(UDPNetworkEncoder::new())),
@@ -407,7 +420,8 @@ impl BedrockClient {
                 debug!("received nack, client is missing packets");
             }
             0x80..0x8d => {
-                self.handle_frame_set(server, FrameSet::read(reader)?).await;
+                self.handle_frame_set(server, FrameSet::read(reader)?)
+                    .await?;
             }
             id => {
                 warn!("Bedrock: Received unknown packet header {id}");
@@ -418,13 +432,77 @@ impl BedrockClient {
 
     const fn handle_ack(_ack: &Ack) {}
 
-    async fn handle_frame_set(self: &Arc<Self>, server: &Arc<Server>, frame_set: FrameSet) {
+    async fn handle_frame_set(
+        self: &Arc<Self>,
+        server: &Arc<Server>,
+        frame_set: FrameSet,
+    ) -> Result<(), Error> {
         // TODO: Send all ACKs in short intervals in batches
         self.send_ack(&Ack::new(vec![frame_set.sequence.0])).await;
         // TODO
         for frame in frame_set.frames {
-            self.handle_frame(server, frame).await.unwrap();
+            self.handle_frame(server, frame).await?;
         }
+        Ok(())
+    }
+
+    /// Stores a fragment of a split packet and returns the reassembled frame once all fragments arrived.
+    ///
+    /// Fragments with implausible or inconsistent split metadata are silently dropped: the client
+    /// controls every value here, so none of them may drive an allocation or an index unchecked.
+    async fn reassemble_fragment(&self, frame: Frame) -> Option<Frame> {
+        if frame.split_size > MAX_SPLIT_COUNT || frame.split_index >= frame.split_size {
+            debug!(
+                "Bedrock: Dropping fragment {}/{} of split packet {} with an invalid split size or index",
+                frame.split_index, frame.split_size, frame.split_id
+            );
+            return None;
+        }
+
+        let fragment_index = frame.split_index as usize;
+        let split_size = frame.split_size as usize;
+        let compound_id = frame.split_id;
+        let mut compounds = self.compounds.lock().await;
+
+        if compounds.len() >= MAX_COMPOUNDS && !compounds.contains_key(&compound_id) {
+            debug!("Bedrock: Too many incomplete split packets, dropping all of them");
+            compounds.clear();
+            return None;
+        }
+
+        let entry = compounds.entry(compound_id).or_insert_with(|| {
+            let mut vec = Vec::with_capacity(split_size);
+            vec.resize_with(split_size, || None);
+            vec
+        });
+
+        // The split size announced by the first fragment is authoritative
+        if entry.len() != split_size {
+            debug!(
+                "Bedrock: Dropping fragment of split packet {compound_id} with a mismatched split size"
+            );
+            return None;
+        }
+
+        let slot = entry.get_mut(fragment_index)?;
+        *slot = Some(frame);
+
+        // Check if all fragments are received
+        if entry.iter().any(Option::is_none) {
+            return None;
+        }
+
+        let fragments = compounds.remove(&compound_id).unwrap_or_default();
+        drop(compounds);
+
+        let mut fragments = fragments.into_iter().flatten();
+        let mut merged = fragments.next()?;
+        for fragment in fragments {
+            merged.payload.extend_from_slice(&fragment.payload);
+        }
+        merged.split_size = 0;
+
+        Some(merged)
     }
 
     async fn handle_frame(
@@ -433,41 +511,10 @@ impl BedrockClient {
         mut frame: Frame,
     ) -> Result<(), Error> {
         if frame.split_size > 0 {
-            let fragment_index = frame.split_index as usize;
-            let compound_id = frame.split_id;
-            let mut compounds = self.compounds.lock().await;
-
-            let entry = compounds.entry(compound_id).or_insert_with(|| {
-                let mut vec = Vec::with_capacity(frame.split_size as usize);
-                vec.resize_with(frame.split_size as usize, || None);
-                vec
-            });
-
-            entry[fragment_index] = Some(frame);
-
-            // Check if all fragments are received
-            if entry.iter().any(Option::is_none) {
+            let Some(merged) = self.reassemble_fragment(frame).await else {
                 return Ok(());
-            }
-
-            let mut frames = compounds.remove(&compound_id).unwrap();
-
-            // Safety: We already checked that all frames are Some at this point
-            let len = frames
-                .iter()
-                .map(|frame| unsafe { frame.as_ref().unwrap_unchecked().payload.len() })
-                .sum();
-
-            let mut merged = Vec::with_capacity(len);
-
-            for frame in &frames {
-                merged.extend_from_slice(unsafe { &frame.as_ref().unwrap_unchecked().payload });
-            }
-
-            frame = unsafe { frames[0].take().unwrap_unchecked() };
-
-            frame.payload = merged;
-            frame.split_size = 0;
+            };
+            frame = merged;
         }
 
         let mut payload = Cursor::new(frame.payload);
@@ -498,8 +545,12 @@ impl BedrockClient {
                     .await;
             }
             _ => {
-                self.handle_play_packet(self.player.lock().await.as_ref().unwrap(), server, packet)
-                    .await;
+                // Clone the player out of the lock: play handlers may kick, which locks it again
+                let player = self.player.lock().await.clone();
+                let Some(player) = player else {
+                    return Err(Error::other("play packet before login"));
+                };
+                self.handle_play_packet(&player, server, packet).await?;
             }
         }
         Ok(())
@@ -510,46 +561,43 @@ impl BedrockClient {
         player: &Arc<Player>,
         server: &Arc<Server>,
         packet: RawPacket,
-    ) {
+    ) -> Result<(), Error> {
         let reader = &mut &packet.payload[..];
         match packet.id {
             SPlayerAuthInput::PACKET_ID => {
-                if let Ok(input_packet) = SPlayerAuthInput::read(reader) {
-                    self.player_pos_update(player, input_packet).await;
-                }
+                self.player_pos_update(player, SPlayerAuthInput::read(reader)?)
+                    .await;
             }
             SLoadingScreen::PACKET_ID => {
-                if SLoadingScreen::read(reader).unwrap().is_loading_done() {
+                if SLoadingScreen::read(reader)?.is_loading_done() {
                     player.set_client_loaded(true);
                 }
             }
             SRequestChunkRadius::PACKET_ID => {
-                self.handle_request_chunk_radius(
-                    player,
-                    SRequestChunkRadius::read(reader).unwrap(),
-                )
-                .await;
+                self.handle_request_chunk_radius(player, SRequestChunkRadius::read(reader)?)
+                    .await;
             }
             SInteraction::PACKET_ID => {
-                self.handle_interaction(player, SInteraction::read(reader).unwrap())
+                self.handle_interaction(player, SInteraction::read(reader)?)
                     .await;
             }
             SContainerClose::PACKET_ID => {
-                self.handle_container_close(player, SContainerClose::read(reader).unwrap())
+                self.handle_container_close(player, SContainerClose::read(reader)?)
                     .await;
             }
             SText::PACKET_ID => {
-                self.handle_chat_message(server, player, SText::read(reader).unwrap())
+                self.handle_chat_message(server, player, SText::read(reader)?)
                     .await;
             }
             SCommandRequest::PACKET_ID => {
-                self.handle_chat_command(player, server, SCommandRequest::read(reader).unwrap())
+                self.handle_chat_command(player, server, SCommandRequest::read(reader)?)
                     .await;
             }
             _ => {
                 warn!("Bedrock: Received Unknown Game packet: {}", packet.id);
             }
         }
+        Ok(())
     }
 
     async fn handle_raknet_packet(

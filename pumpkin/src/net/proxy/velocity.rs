@@ -48,8 +48,9 @@ pub enum VelocityError {
 }
 
 pub async fn velocity_login(client: &JavaClient) {
-    // TODO: Validate the packet transaction id from the plugin response with this
     let velocity_message_id: i32 = rand::rng().random();
+    // The response must carry this id back; see `handle_plugin_response`.
+    client.velocity_message_id.store(Some(velocity_message_id));
 
     let mut buf = BytesMut::new();
     buf.put_u8(MAX_SUPPORTED_FORWARDING_VERSION);
@@ -111,7 +112,10 @@ pub fn receive_velocity_plugin_response(
 ) -> Result<(GameProfile, SocketAddr), VelocityError> {
     debug!("Received velocity response");
     if let Some(data) = response.data {
-        let (signature, mut data_without_signature) = data.split_at(32);
+        // The payload starts with a 32 byte HMAC; anything shorter is not a Velocity response.
+        let Some((signature, mut data_without_signature)) = data.split_at_checked(32) else {
+            return Err(VelocityError::NoData);
+        };
 
         if !check_integrity((signature, data_without_signature), &config.secret) {
             return Err(VelocityError::FailedVerifyIntegrity);
@@ -122,7 +126,9 @@ pub fn receive_velocity_plugin_response(
             .get_var_int()
             .map_err(|_| VelocityError::FailedReadForwardVersion)?;
 
-        let version = version.0 as u8;
+        let version = u8::try_from(version.0).map_err(|_| {
+            VelocityError::UnsupportedForwardVersion(u8::MAX, MAX_SUPPORTED_FORWARDING_VERSION)
+        })?;
         if version > MAX_SUPPORTED_FORWARDING_VERSION {
             return Err(VelocityError::UnsupportedForwardVersion(
                 version,

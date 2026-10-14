@@ -18,6 +18,7 @@ use connection_cache::{CachedBranding, CachedStatus};
 use key_store::KeyStore;
 use pumpkin_config::{AdvancedConfiguration, BasicConfiguration};
 use pumpkin_data::dimension::Dimension;
+use pumpkin_data::translation;
 use pumpkin_util::permission::{PermissionManager, PermissionRegistry};
 use pumpkin_util::text::color::NamedColor;
 use pumpkin_world::dimension::into_level;
@@ -78,6 +79,9 @@ pub struct Server {
     key_store: OnceCell<Arc<KeyStore>>,
     /// Manages server status information.
     listing: Mutex<CachedStatus>,
+    /// Serializes the "may this profile join?" check with the insertion into a world, so two
+    /// concurrent logins can't both pass the duplicate/max-players checks.
+    player_join_lock: Mutex<()>,
     /// Saves server branding information.
     branding: CachedBranding,
     /// Saves and dispatches commands to appropriate handlers.
@@ -230,6 +234,7 @@ impl Server {
             item_registry: super::item::items::default_registry(),
             key_store: OnceCell::new(),
             listing,
+            player_join_lock: Mutex::new(()),
             branding: CachedBranding::new(),
             bossbars: Mutex::new(CustomBossbars::new()),
             defaultgamemode,
@@ -361,6 +366,15 @@ impl Server {
         profile: GameProfile,
         config: Option<PlayerConfig>,
     ) -> Option<(Arc<Player>, Arc<World>)> {
+        // Held until the player is in a world: the checks below and the insertion must be
+        // atomic, otherwise two sessions for the same account (or more players than
+        // `max_players`) can slip through at the same time.
+        let _join_guard = self.player_join_lock.lock().await;
+        if let Some(reason) = self.join_rejection(&profile) {
+            client.kick(DisconnectReason::Kicked, reason).await;
+            return None;
+        }
+
         let gamemode = self.defaultgamemode.lock().await.gamemode;
 
         let (world, nbt) = if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
@@ -443,6 +457,26 @@ impl Server {
                 None
             }
         }}
+    }
+
+    /// Why `profile` can't join right now (server full, or already online), if anything.
+    fn join_rejection(&self, profile: &GameProfile) -> Option<TextComponent> {
+        let max_players = self.basic_config.max_players;
+        if max_players > 0 && self.get_player_count() >= max_players as usize {
+            return Some(TextComponent::translate(
+                translation::MULTIPLAYER_DISCONNECT_SERVER_FULL,
+                [],
+            ));
+        }
+        if self.get_player_by_uuid(profile.id).is_some()
+            || self.get_player_by_name(&profile.name).is_some()
+        {
+            return Some(TextComponent::translate(
+                translation::MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN,
+                [],
+            ));
+        }
+        None
     }
 
     pub async fn remove_player(&self, player: &Player) {

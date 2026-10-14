@@ -17,9 +17,11 @@ impl BannedPlayerList {
     #[must_use]
     pub fn get_entry(&mut self, profile: &GameProfile) -> Option<&BannedPlayerEntry> {
         self.remove_invalid_entries();
+        // Match on the UUID only (like vanilla): a banned account must not be able to evade
+        // the ban by changing its name.
         self.banned_players
             .iter()
-            .find(|entry| entry.name == profile.name && entry.uuid == profile.id)
+            .find(|entry| entry.uuid == profile.id)
     }
 
     fn remove_invalid_entries(&mut self) {

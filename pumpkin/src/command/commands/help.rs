@@ -42,18 +42,16 @@ impl CommandExecutor for Executor {
             let description = &tree.description;
 
             let header_text = format!(" Help - /{} ", tree.names[0]);
+            let padding = 52usize.saturating_sub(header_text.len()) / 2;
 
             let mut message = TextComponent::text("")
                 .add_child(
-                    TextComponent::text("-".repeat((52 - header_text.len()) / 2) + " ")
-                        .color_named(NamedColor::Yellow),
+                    TextComponent::text("-".repeat(padding) + " ").color_named(NamedColor::Yellow),
                 )
                 .add_child(TextComponent::text(header_text.clone()))
                 .add_child(
-                    TextComponent::text(
-                        " ".to_owned() + &"-".repeat((52 - header_text.len()) / 2) + "\n",
-                    )
-                    .color_named(NamedColor::Yellow),
+                    TextComponent::text(" ".to_owned() + &"-".repeat(padding) + "\n")
+                        .color_named(NamedColor::Yellow),
                 )
                 .add_child(
                     TextComponent::text("Command: ")
@@ -171,20 +169,18 @@ impl CommandExecutor for BaseHelpExecutor {
             };
 
             let header_text = format!(" Help - Page {page}/{total_pages} ");
+            let padding = 52usize.saturating_sub(header_text.len() + 3) / 2;
 
             let mut message = TextComponent::text("")
                 .add_child(
-                    TextComponent::text("-".repeat((52 - header_text.len() - 3) / 2) + " ")
-                        .color_named(NamedColor::Yellow),
+                    TextComponent::text("-".repeat(padding) + " ").color_named(NamedColor::Yellow),
                 )
                 .add_child(arrow_left.clone())
                 .add_child(TextComponent::text(header_text.clone()))
                 .add_child(arrow_right.clone())
                 .add_child(
-                    TextComponent::text(
-                        " ".to_owned() + &"-".repeat((52 - header_text.len() - 3) / 2) + "\n",
-                    )
-                    .color_named(NamedColor::Yellow),
+                    TextComponent::text(" ".to_owned() + &"-".repeat(padding) + "\n")
+                        .color_named(NamedColor::Yellow),
                 );
 
             for tree in page_commands {
@@ -210,19 +206,17 @@ impl CommandExecutor for BaseHelpExecutor {
             }
 
             let footer_text = format!(" Page {page}/{total_pages} ");
+            let padding = 52usize.saturating_sub(footer_text.len() + 3) / 2;
             message = message
                 .add_child(
-                    TextComponent::text("-".repeat((52 - footer_text.len() - 3) / 2) + " ")
-                        .color_named(NamedColor::Yellow),
+                    TextComponent::text("-".repeat(padding) + " ").color_named(NamedColor::Yellow),
                 )
                 .add_child(arrow_left)
                 .add_child(TextComponent::text(footer_text.clone()))
                 .add_child(arrow_right)
                 .add_child(
-                    TextComponent::text(
-                        " ".to_owned() + &"-".repeat((52 - footer_text.len() - 3) / 2),
-                    )
-                    .color_named(NamedColor::Yellow),
+                    TextComponent::text(" ".to_owned() + &"-".repeat(padding))
+                        .color_named(NamedColor::Yellow),
                 );
 
             sender.send_message(message).await;

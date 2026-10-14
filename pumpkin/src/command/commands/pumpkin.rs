@@ -5,6 +5,8 @@ use pumpkin_util::text::{TextComponent, color::NamedColor};
 use pumpkin_util::translation::get_translation_text;
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::time::Duration;
+use tokio::sync::OnceCell;
 
 use crate::command::CommandResult;
 use crate::command::{CommandExecutor, CommandSender, args::ConsumedArgs, tree::CommandTree};
@@ -24,14 +26,34 @@ struct Contributor {
     login: String,
 }
 
+/// Contributors are fetched at most once per server run, so that `/pumpkin` does not
+/// perform (blocking) HTTP requests on every invocation.
+static CONTRIBUTORS: OnceCell<Vec<Contributor>> = OnceCell::const_new();
+
+async fn get_contributors() -> &'static [Contributor] {
+    CONTRIBUTORS
+        .get_or_init(|| async {
+            // ureq is blocking; keep it off the async workers
+            tokio::task::spawn_blocking(fetch_all_contributors)
+                .await
+                .unwrap_or_default()
+        })
+        .await
+}
+
 fn fetch_all_contributors() -> Vec<Contributor> {
     let mut all_contributors = Vec::new();
     let mut next_url = Some(
         "https://api.github.com/repos/Pumpkin-MC/Pumpkin/contributors?per_page=100".to_string(),
     );
 
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+
     while let Some(url) = next_url {
-        let response = ureq::get(&url).header("User-Agent", "Pumpkin-MC").call();
+        let response = agent.get(&url).header("User-Agent", "Pumpkin-MC").call();
 
         match response {
             Ok(mut res) => {
@@ -62,7 +84,7 @@ fn extract_next_url(header: &str) -> Option<String> {
         .and_then(|part| {
             let start = part.find('<')? + 1;
             let end = part.find('>')?;
-            Some(part[start..end].to_string())
+            part.get(start..end).map(str::to_string)
         })
 }
 
@@ -75,7 +97,7 @@ impl CommandExecutor for Executor {
         _args: &'a ConsumedArgs<'a>,
     ) -> CommandResult<'a> {
         Box::pin(async move {
-            let contributors = fetch_all_contributors();
+            let contributors = get_contributors().await;
             let contributor_names = contributors
                 .iter()
                 .map(|c| c.login.as_str())
@@ -103,7 +125,7 @@ impl CommandExecutor for Executor {
                         vec![TextComponent::text(version_string.clone())],
                     )
                     .hover_event(HoverEvent::show_text(
-                        TextComponent::text(format!("Commit: {GIT_HASH_FULL}\n\nContributors:\n",))
+                        TextComponent::text(format!("Commit: {GIT_HASH_FULL}\n\nContributors:\n"))
                             .add_child(
                                 TextComponent::text(contributor_names)
                                     .gradient_named(&[NamedColor::DarkGreen, NamedColor::Green])

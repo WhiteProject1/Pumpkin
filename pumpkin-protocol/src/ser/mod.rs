@@ -102,8 +102,10 @@ impl<R: Read> NetworkReadExt for R {
     get_number_be!(get_f64_be, f64);
 
     fn read_boxed_slice(&mut self, length: usize) -> Result<Box<[u8]>, ReadingError> {
-        const MAX_SLICE_LENGTH: usize = 2 * 1024 * 64; // 64KB, largest valid MC packet
-        if !(1..=MAX_SLICE_LENGTH).contains(&length) {
+        // 128 KiB: a vanilla string is at most 32767 chars, i.e. 98301 UTF-8 bytes
+        const MAX_SLICE_LENGTH: usize = 128 * 1024;
+        // Zero-length is legitimate (e.g. a blank sign line or an empty command).
+        if length > MAX_SLICE_LENGTH {
             return Err(ReadingError::Message(format!(
                 "read_boxed_slice: length {length} out of bounds"
             )));
@@ -163,7 +165,8 @@ impl<R: Read> NetworkReadExt for R {
     }
 
     fn get_string(&mut self) -> Result<String, ReadingError> {
-        self.get_string_bounded(i32::MAX as usize)
+        // Vanilla's default `readUtf()` limit of 32767 chars, in UTF-8 bytes.
+        self.get_string_bounded(32767 * 3)
     }
 
     fn get_uuid(&mut self) -> Result<uuid::Uuid, ReadingError> {
@@ -339,7 +342,13 @@ impl<W: Write> NetworkWriteExt for W {
     }
 
     fn write_string_bounded(&mut self, data: &str, bound: usize) -> Result<(), WritingError> {
-        assert!(data.len() <= bound);
+        // An error, not a panic: the string may originate from a client (e.g. echoed text).
+        if data.len() > bound {
+            return Err(WritingError::Message(format!(
+                "string of {} bytes exceeds the limit of {bound}",
+                data.len()
+            )));
+        }
         self.write_var_int(&data.len().try_into().map_err(|_| {
             WritingError::Message(format!("{} isn't representable as a VarInt", data.len()))
         })?)?;

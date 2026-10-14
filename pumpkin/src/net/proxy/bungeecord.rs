@@ -15,6 +15,10 @@ pub enum BungeeCordError {
     FailedParseProperties,
     #[error("Failed to make offline UUID")]
     FailedMakeOfflineUUID,
+    #[error(
+        "If you wish to use IP forwarding, please enable it in your BungeeCord config as well!"
+    )]
+    MissingForwardingData,
 }
 
 /// Attempts to login a player via `BungeeCord`.
@@ -27,10 +31,11 @@ pub enum BungeeCordError {
 /// 2. UUID (if `ip_forward` is enabled on the `BungeeCord` server)
 /// 3. Game profile properties (if `ip_forward` and `online_mode` are enabled on the `BungeeCord` server)
 ///
-/// If any of the optional data is missing, the function will attempt to
-/// determine the player's information locally.
+/// The IP and UUID fields are mandatory, like Spigot requires them: a client that connects
+/// directly (bypassing the proxy) must not be able to pick its own identity by omitting them.
+/// Operators still need to firewall the backend port, as with any `BungeeCord` setup.
 pub async fn bungeecord_login(
-    client_address: &Mutex<SocketAddr>,
+    _client_address: &Mutex<SocketAddr>,
     server_address: &str,
     name: String,
 ) -> Result<(IpAddr, GameProfile), BungeeCordError> {
@@ -43,15 +48,17 @@ pub async fn bungeecord_login(
         Some(ip_str) if !ip_str.is_empty() => ip_str
             .parse()
             .map_err(|_| BungeeCordError::FailedParseAddress)?,
-        _ => client_address.lock().await.ip(),
+        _ => return Err(BungeeCordError::MissingForwardingData),
     };
 
     let id = match parts.next() {
         Some(uuid_str) if !uuid_str.is_empty() => uuid_str
             .parse()
             .map_err(|_| BungeeCordError::FailedParseUUID)?,
-        _ => offline_uuid(&name).map_err(|_| BungeeCordError::FailedMakeOfflineUUID)?,
+        _ => return Err(BungeeCordError::MissingForwardingData),
     };
+    // Keep the offline derivation reachable for callers that need it.
+    let _ = offline_uuid;
 
     let properties = match parts.next() {
         Some(json_str) if !json_str.is_empty() => {
