@@ -35,7 +35,12 @@ impl BedrockClient {
         server: &Server,
     ) -> Result<PacketHandlerResult, LoginError> {
         let auth_payload: AuthPayload = serde_json::from_slice(&packet.jwt)?;
-        let player_data = if server.advanced_config.networking.bedrock.online_mode {
+        let online_mode = server.advanced_config.networking.bedrock.online_mode;
+        // Only a Mojang-signed token can be captured from another server and
+        // replayed, so only that kind of login must be bound to the session's key.
+        let require_session_identity =
+            online_mode && matches!(auth_payload.authentication_type, AuthenticationType::Full);
+        let player_data = if online_mode {
             match auth_payload.authentication_type {
                 AuthenticationType::Full => {
                     verify_oidc_token_path(server, &auth_payload.token, false).await?
@@ -89,18 +94,7 @@ impl BedrockClient {
             profile_actions: None,
         };
 
-        let login_public_key = pumpkin_auth::jwt::extract_cpk_from_token(&auth_payload.token)
-            .map_err(LoginError::ChainValidationFailed)?;
-        if self
-            .nethernet_public_key()
-            .is_some_and(|public_key| public_key != &login_public_key)
-        {
-            return Err(LoginError::ChainValidationFailed(
-                AuthError::PublicKeyBuild(
-                    "NetherNet and Bedrock login identities do not match".into(),
-                ),
-            ));
-        }
+        self.verify_session_identity(&auth_payload.token, require_session_identity)?;
 
         self.enqueue_client_packet(&CPlayStatus::LoginSuccess).await;
         let br_config = &server.advanced_config.resource_pack.bedrock;
@@ -141,6 +135,32 @@ impl BedrockClient {
             .store(std::sync::Arc::new(Some(std::sync::Arc::new(client_data))));
 
         Ok(PacketHandlerResult::ReadyToPlay(profile, new_config))
+    }
+
+    /// Checks that the login token's client public key is the one this `NetherNet`
+    /// session was negotiated with.
+    fn verify_session_identity(
+        &self,
+        token: &str,
+        require_identity: bool,
+    ) -> Result<(), LoginError> {
+        let login_public_key = pumpkin_auth::jwt::extract_cpk_from_token(token)
+            .map_err(LoginError::ChainValidationFailed)?;
+        match self.nethernet_public_key() {
+            Some(public_key) if public_key != &login_public_key => Err(
+                LoginError::ChainValidationFailed(AuthError::PublicKeyBuild(
+                    "NetherNet and Bedrock login identities do not match".into(),
+                )),
+            ),
+            // LAN-signaled sessions carry no SDP identity and discovery answers anyone,
+            // so without the session key the token proves nothing about this connection.
+            None if require_identity => Err(LoginError::ChainValidationFailed(
+                AuthError::PublicKeyBuild(
+                    "NetherNet session has no identity to bind the Bedrock login to".into(),
+                ),
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
