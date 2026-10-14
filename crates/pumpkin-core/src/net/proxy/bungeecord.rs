@@ -5,7 +5,7 @@ use std::{net::IpAddr, net::SocketAddr};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::net::{GameProfile, offline_uuid};
+use crate::net::GameProfile;
 use pumpkin_protocol::Property;
 
 /// The property name the `BungeeGuard` plugin uses to forward its shared
@@ -20,12 +20,14 @@ pub enum BungeeCordError {
     FailedParseUUID,
     #[error("Failed to parse properties")]
     FailedParseProperties,
-    #[error("Failed to make offline UUID")]
-    FailedMakeOfflineUUID,
     #[error("No BungeeGuard token in forwarded data")]
     MissingToken,
     #[error("Invalid BungeeGuard token")]
     InvalidToken,
+    #[error(
+        "If you wish to use IP forwarding, please enable it in your BungeeCord config as well!"
+    )]
+    MissingForwardingData,
 }
 
 /// Attempts to login a player via `BungeeCord`.
@@ -44,10 +46,10 @@ pub enum BungeeCordError {
 /// mismatched token rejects the connection. This also blocks players
 /// connecting directly to this server, bypassing the proxy.
 ///
-/// If any of the optional data is missing, the function will attempt to
-/// determine the player's information locally.
+/// The address and UUID are mandatory (as for Spigot): a direct client
+/// must not pick its own identity by leaving them out.
 pub fn bungeecord_login(
-    client_address: &SocketAddr,
+    _client_address: &SocketAddr,
     server_address: &str,
     name: String,
     secret: &str,
@@ -61,14 +63,14 @@ pub fn bungeecord_login(
         Some(ip_str) if !ip_str.is_empty() => ip_str
             .parse()
             .map_err(|_| BungeeCordError::FailedParseAddress)?,
-        _ => client_address.ip(),
+        _ => return Err(BungeeCordError::MissingForwardingData),
     };
 
     let id = match parts.next() {
         Some(uuid_str) if !uuid_str.is_empty() => uuid_str
             .parse()
             .map_err(|_| BungeeCordError::FailedParseUUID)?,
-        _ => offline_uuid(&name).map_err(|_| BungeeCordError::FailedMakeOfflineUUID)?,
+        _ => return Err(BungeeCordError::MissingForwardingData),
     };
 
     let mut properties: Vec<Property> = match parts.next() {
@@ -284,7 +286,34 @@ mod tests {
             SECRET,
         );
 
-        assert!(matches!(result, Err(BungeeCordError::MissingToken)));
+        // The forwarding fields are checked first.
+        assert!(matches!(
+            result,
+            Err(BungeeCordError::MissingForwardingData)
+        ));
+    }
+
+    /// A handshake without the forwarded fields must not fall back to a
+    /// client chosen identity.
+    #[test]
+    fn rejects_direct_connection_without_forwarding_data() {
+        let result = bungeecord_login(
+            &client_address(),
+            "mc.example.com",
+            "Steve".to_string(),
+            "",
+        );
+        assert!(matches!(
+            result,
+            Err(BungeeCordError::MissingForwardingData)
+        ));
+
+        let only_ip = format!("mc.example.com\0{}", client_address().ip());
+        let result = bungeecord_login(&client_address(), &only_ip, "Steve".to_string(), "");
+        assert!(matches!(
+            result,
+            Err(BungeeCordError::MissingForwardingData)
+        ));
     }
 
     #[test]
