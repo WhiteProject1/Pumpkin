@@ -634,6 +634,12 @@ impl<S: CommandSource> CommandDispatcher<S> {
         let mut suggestions = Vec::with_capacity(children.len());
 
         for child in children {
+            // Like `parse_nodes`, skip what the source may not run so completions
+            // don't reveal hidden commands or literals.
+            if !self.tree.can_use(child, &context.source) {
+                continue;
+            }
+
             let builder = SuggestionsBuilder::new(truncated_input, start);
 
             match self.tree.classify_id(child) {
@@ -1257,6 +1263,55 @@ mod test {
                 Ok(1)
             );
         }
+    }
+
+    #[test]
+    fn suggestions_skip_nodes_the_source_cannot_use() {
+        #[derive(Clone)]
+        struct PermissionSource(bool);
+
+        impl CommandSource for PermissionSource {
+            fn send_message(&self, _message: TextComponent) {}
+
+            fn has_permission(&self, permission: &str) -> bool {
+                permission == "test.command" && self.0
+            }
+        }
+
+        let mut dispatcher = CommandDispatcher::<PermissionSource>::new();
+        let executor: fn(&CommandContext<PermissionSource>) -> CommandExecutorResult = |_| Ok(1);
+        // A restricted root command and a restricted literal, each next to an open one:
+        // completions must only reveal what the source could run.
+        dispatcher.register(
+            CommandArgumentBuilder::new("op", "A restricted command")
+                .requires("test.command")
+                .executes(executor),
+        );
+        dispatcher.register(
+            CommandArgumentBuilder::new("open", "An open command")
+                .then(LiteralArgumentBuilder::new("public").executes(executor))
+                .then(
+                    LiteralArgumentBuilder::new("private")
+                        .requires("test.command")
+                        .executes(executor),
+                ),
+        );
+
+        let names = |input: &str, source: &PermissionSource| {
+            dispatcher
+                .suggest(input, source)
+                .into_iter()
+                .map(|suggestion| suggestion.suggestion)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names("o", &PermissionSource(false)), ["open"]);
+        assert_eq!(names("o", &PermissionSource(true)), ["op", "open"]);
+        assert_eq!(names("open p", &PermissionSource(false)), ["public"]);
+        assert_eq!(
+            names("open p", &PermissionSource(true)),
+            ["private", "public"]
+        );
     }
 
     #[test]
