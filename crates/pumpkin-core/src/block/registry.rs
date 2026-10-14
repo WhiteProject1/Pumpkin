@@ -758,6 +758,12 @@ impl BlockRegistry {
             use_item_on,
         );
 
+        // Air is vanilla's null `getStateForPlacement`: nothing is placed, and setting
+        // air would replace the clicked water or snow and still take the item.
+        if new_state == BlockStateId::AIR {
+            return Ok(None);
+        }
+
         // Mirror vanilla obstruction checks: only entities that block building should prevent
         // placement. (e.g. arrows/xp orbs/displays/markers should not)
         let state = BlockState::from_id(new_state);
