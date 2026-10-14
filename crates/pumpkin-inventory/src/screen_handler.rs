@@ -676,9 +676,14 @@ pub trait ScreenHandler: Send + Sync {
                 let mut slot_stack = slot.get_stack();
 
                 if !slot_stack.is_empty() && slot_stack.are_items_and_components_equal(stack) {
-                    let combined_count = slot_stack.item_count + stack.item_count;
                     let max_slot_count = slot.get_max_item_count_for_stack(&slot_stack);
-                    if combined_count <= max_slot_count {
+                    // Oversized stacks can overflow a `u8` and silently lose items, so a
+                    // sum that doesn't fit is over the slot limit like any other.
+                    let combined_count = slot_stack
+                        .item_count
+                        .checked_add(stack.item_count)
+                        .filter(|combined_count| *combined_count <= max_slot_count);
+                    if let Some(combined_count) = combined_count {
                         stack.set_count(0);
                         slot_stack.set_count(combined_count);
                         slot.set_stack(slot_stack);
@@ -1310,5 +1315,41 @@ impl ScreenHandlerBehaviour {
     pub fn next_revision(&self) -> u32 {
         self.revision.fetch_add(1, Ordering::Relaxed);
         self.revision.fetch_and(32767, Ordering::Relaxed) & 32767
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use pumpkin_data::item::Item;
+
+    use crate::crafting::crafting_screen_handler::CraftingTableScreenHandler;
+    use crate::entity_equipment::EntityEquipment;
+    use crate::inventory::Inventory;
+    use crate::player::player_inventory::PlayerInventory;
+
+    use super::*;
+
+    #[test]
+    fn inserting_into_a_matching_stack_does_not_overflow_the_count() {
+        let player_inventory = Arc::new(PlayerInventory::new(
+            Arc::new(Mutex::new(EntityEquipment::new())),
+            Arc::new(rustc_hash::FxHashMap::default()),
+        ));
+        // Oversized stacks exist, and 200 + 100 doesn't fit in a `u8`.
+        player_inventory.set_stack(9, ItemStack::new(200, &Item::STICK));
+        let mut handler = CraftingTableScreenHandler::new(1, &player_inventory, None);
+
+        // Screen slots 10..46 are the player's main inventory and hotbar.
+        let mut stack = ItemStack::new(100, &Item::STICK);
+        assert!(handler.insert_item(&mut stack, 10, 46, false));
+
+        // The full stack stays put and the rest goes to an empty slot; nothing is lost.
+        assert_eq!(player_inventory.get_stack(9).item_count, 200);
+        let in_inventory: usize = (0..36)
+            .map(|slot| usize::from(player_inventory.get_stack(slot).item_count))
+            .sum();
+        assert_eq!(in_inventory + usize::from(stack.item_count), 300);
     }
 }
