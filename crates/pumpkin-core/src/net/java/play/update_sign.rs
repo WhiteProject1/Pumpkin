@@ -26,12 +26,14 @@ impl JavaClient {
             return;
         }
 
-        let lines = vec![
-            sign_data.line_1.to_string(),
-            sign_data.line_2.to_string(),
-            sign_data.line_3.to_string(),
-            sign_data.line_4.to_string(),
+        // Like vanilla's `StringUtil.filterText`.
+        let filtered = [
+            filter_sign_line(sign_data.line_1),
+            filter_sign_line(sign_data.line_2),
+            filter_sign_line(sign_data.line_3),
+            filter_sign_line(sign_data.line_4),
         ];
+        let lines = filtered.to_vec();
 
         if let Some(player_arc) = world.get_player_by_uuid(player.gameprofile.id) {
             let mut event = crate::plugin::api::events::block::sign_change::SignChangeEvent::new(
@@ -49,12 +51,7 @@ impl JavaClient {
 
         let text = sign_entity.get_text(sign_data.is_front_text);
 
-        let new_messages = [
-            Box::<str>::from(sign_data.line_1),
-            Box::<str>::from(sign_data.line_2),
-            Box::<str>::from(sign_data.line_3),
-            Box::<str>::from(sign_data.line_4),
-        ];
+        let new_messages = filtered.map(Box::<str>::from);
 
         text.messages
             .lock()
@@ -72,5 +69,24 @@ impl JavaClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         world.update_block_entity(&block_entity);
+    }
+}
+
+/// Drops `§` and control characters.
+fn filter_sign_line(line: &str) -> String {
+    line.chars()
+        .filter(|c| *c != '§' && *c >= ' ' && *c != '\x7F')
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_sign_line;
+
+    #[test]
+    fn strips_formatting_and_control_characters() {
+        assert_eq!(filter_sign_line("§cRed\u{1b}[31m\x7F text"), "cRed[31m text");
+        assert_eq!(filter_sign_line("plain line"), "plain line");
+        assert_eq!(filter_sign_line("ünïcödé ok"), "ünïcödé ok");
     }
 }
