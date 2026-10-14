@@ -20,6 +20,8 @@ const DESCRIPTION: &str = "Display information about Pumpkin.";
 const PERMISSION: &str = "pumpkin:command.pumpkin";
 
 const CACHE_DURATION: Duration = Duration::from_hours(24);
+/// The fetches block the command's thread, so a slow upstream must not hold it for long.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Executor;
 
@@ -63,17 +65,19 @@ fn fetch_all_contributors_cached() -> Vec<Contributor> {
         |handle| tokio::task::block_in_place(|| handle.block_on(fetch_all_contributors())),
     );
 
-    if !contributors.is_empty() {
-        if let Ok(mut guard) = CONTRIBUTORS_CACHE.lock() {
-            *guard = Some(ContributorCache {
-                fetched_at: Instant::now(),
-                data: contributors.clone(),
-            });
-        }
-    } else if let Ok(guard) = CONTRIBUTORS_CACHE.lock()
-        && let Some(cache) = guard.as_ref()
-    {
-        return cache.data.clone();
+    // Cache a failed fetch too (keeping any old list), or every /pumpkin would block a
+    // worker thread for the whole timeout while GitHub is down.
+    if let Ok(mut guard) = CONTRIBUTORS_CACHE.lock() {
+        let data = if contributors.is_empty() {
+            guard.take().map_or_else(Vec::new, |cache| cache.data)
+        } else {
+            contributors
+        };
+        *guard = Some(ContributorCache {
+            fetched_at: Instant::now(),
+            data: data.clone(),
+        });
+        return data;
     }
 
     contributors
@@ -81,6 +85,7 @@ fn fetch_all_contributors_cached() -> Vec<Contributor> {
 
 async fn fetch_all_contributors() -> Vec<Contributor> {
     let client = pumpkin_auth::client_builder()
+        .timeout(FETCH_TIMEOUT)
         .user_agent("Pumpkin-MC")
         .build()
         .unwrap_or_default();
@@ -196,6 +201,7 @@ fn tier_color(tier_slug: &str, tier_name: &str) -> NamedColor {
 async fn fetch_donators_hover() -> TextComponent {
     let url = "https://market.pumpkinmc.org/api/v1/rest/donators";
     let client = pumpkin_auth::client_builder()
+        .timeout(FETCH_TIMEOUT)
         .user_agent("Pumpkin-MC")
         .build()
         .unwrap_or_default();
