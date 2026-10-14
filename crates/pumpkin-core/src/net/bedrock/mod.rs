@@ -842,29 +842,55 @@ impl BedrockClient {
         Ok(())
     }
 
+    /// Upper bound on the blob bytes packed into one `CClientCacheMissResponse`.
+    const MAX_BLOB_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
     pub fn handle_client_cache_blob_status(&self, packet: SClientCacheBlobStatus) {
-        if packet.miss_hashes.is_empty() {
-            return;
-        }
-        let missing_blobs = {
-            let cache = self
-                .blob_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut missing_blobs = Vec::with_capacity(packet.miss_hashes.len());
-            for hash in packet.miss_hashes {
-                if let Some(payload) = cache.get(&hash) {
-                    missing_blobs.push(MissingBlobData {
-                        blob_id: hash,
-                        blob_data: payload.clone(),
-                    });
-                } else {
-                    warn!("Client requested missing blob {hash:#x} not found in server cache");
-                }
+        let mut cache = self
+            .blob_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut responses = Vec::new();
+        let mut missing_blobs = Vec::new();
+        let mut response_bytes = 0;
+        let mut unknown_hashes = 0usize;
+        for hash in packet.miss_hashes {
+            // The client holds a served blob from then on, so it is moved out instead of
+            // cloned; that also serves a hash repeated within one packet only once.
+            let Some(payload) = cache.remove(&hash) else {
+                unknown_hashes += 1;
+                continue;
+            };
+            // One status packet may name up to 4096 blobs, so the response is split
+            // instead of being built, serialized and compressed as a single packet.
+            if response_bytes + payload.len() > Self::MAX_BLOB_RESPONSE_BYTES
+                && !missing_blobs.is_empty()
+            {
+                responses.push(std::mem::take(&mut missing_blobs));
+                response_bytes = 0;
             }
-            missing_blobs
-        };
+            response_bytes += payload.len();
+            missing_blobs.push(MissingBlobData {
+                blob_id: hash,
+                blob_data: payload,
+            });
+        }
+        // The client confirmed it holds these, so they no longer need to be kept.
+        for hash in &packet.hit_hashes {
+            cache.remove(hash);
+        }
+        drop(cache);
+
         if !missing_blobs.is_empty() {
+            responses.push(missing_blobs);
+        }
+        if unknown_hashes > 0 {
+            debug!(
+                "Client {} requested {unknown_hashes} blobs that are not in the server cache",
+                self.address
+            );
+        }
+        for missing_blobs in responses {
             self.try_enqueue_client_packet(&CClientCacheMissResponse { missing_blobs });
         }
     }
