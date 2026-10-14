@@ -213,6 +213,49 @@ pub static SERVER_IS_STOPPING: AtomicBool = AtomicBool::new(false);
 pub static CRASH_REPORT: OnceLock<CrashReport> = OnceLock::new();
 pub static SERVER_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
+/// Connections allowed in the login phase at once, per address and in total.
+const MAX_PENDING_CONNECTIONS_PER_IP: u32 = 32;
+const MAX_PENDING_CONNECTIONS: u32 = 1024;
+
+/// Pending Java connections per source address.
+static PENDING_CONNECTIONS: LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, u32>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// One slot in [`PENDING_CONNECTIONS`], released on drop.
+struct PendingConnectionGuard(std::net::IpAddr);
+
+impl PendingConnectionGuard {
+    fn acquire(ip: std::net::IpAddr) -> Option<Self> {
+        let mut pending = PENDING_CONNECTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total: u32 = pending.values().sum();
+        let count = pending.entry(ip).or_insert(0);
+        if *count >= MAX_PENDING_CONNECTIONS_PER_IP || total >= MAX_PENDING_CONNECTIONS {
+            if *count == 0 {
+                pending.remove(&ip);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(Self(ip))
+    }
+}
+
+impl Drop for PendingConnectionGuard {
+    fn drop(&mut self) {
+        let mut pending = PENDING_CONNECTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = pending.get_mut(&self.0) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pending.remove(&self.0);
+            }
+        }
+    }
+}
+
 pub fn stop_server() {
     SHOULD_STOP.store(true, Ordering::Relaxed);
     STOP_INTERRUPT.cancel();
@@ -560,6 +603,13 @@ impl PumpkinServer {
             tcp_result = resolve_some(self.tcp_listener.as_ref(), tokio::net::TcpListener::accept) => {
                 match tcp_result {
                     Ok((connection, client_addr)) => {
+                        // A pending connection is cheap for the client, not for us.
+                        let Some(pending_guard) = PendingConnectionGuard::acquire(client_addr.ip()) else {
+                            debug!("Dropping connection from {client_addr}: too many pending connections");
+                            drop(connection);
+                            return true;
+                        };
+
                         if let Err(e) = connection.set_nodelay(true) {
                             warn!("Failed to set TCP_NODELAY: {e}");
                         }
@@ -587,6 +637,8 @@ impl PumpkinServer {
                                 Arc::downgrade(&server_clone),
                             );
                             let login_result = pending.handle_login_sequence(&server_clone).await;
+                            // From here on it is a player (or closed).
+                            drop(pending_guard);
 
                             match login_result {
                                 PacketHandlerResult::Stop => {
