@@ -433,11 +433,21 @@ pub enum EncryptionError {
     VerifyTokenMismatch,
 }
 
-fn is_valid_player_name(name: &str) -> bool {
-    if name.len() > 16 {
+/// 1..=16 bytes, no control characters, whitespace or formatting codes.
+pub(crate) fn is_valid_player_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 16 {
         return false;
     }
-    !name.chars().any(|c| c.is_control() || c == ' ')
+    // `§`, exotic whitespace and invisible format characters are not controls.
+    !name.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || c == '§'
+            || c == '\u{FEFF}'
+            || ('\u{200B}'..='\u{200F}').contains(&c)
+            || ('\u{202A}'..='\u{202E}').contains(&c)
+            || ('\u{2060}'..='\u{2064}').contains(&c)
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -676,14 +686,23 @@ mod tests {
         );
     }
 
-    /// Test case for an empty string (length 0, but included for completeness).
+    /// Test case for an empty string: a player needs a name.
     #[test]
     fn invalid_empty_string() {
         let name = "";
         assert!(
-            is_valid_player_name(name),
-            "Empty string should be valid (length <= 16 and no invalid chars)"
+            !is_valid_player_name(name),
+            "Empty string should be invalid"
         );
+    }
+
+    /// Formatting codes and invisible characters are rejected.
+    #[test]
+    fn invalid_formatting_code_and_unicode_whitespace() {
+        assert!(!is_valid_player_name("§cRed"));
+        assert!(!is_valid_player_name("Play\u{00A0}er"));
+        assert!(!is_valid_player_name("Play\u{200B}er"));
+        assert!(!is_valid_player_name("Play\u{202E}er"));
     }
 
     /// Test case for a name containing a control character (e.g., Null, codepoint 0).
