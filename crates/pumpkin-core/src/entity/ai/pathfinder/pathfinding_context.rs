@@ -44,6 +44,7 @@ pub struct PathfindingContext {
     mob_position: Vector3<i32>,
     world: Arc<World>,
     collision_cache: FxHashMap<[u64; 6], bool>,
+    land_type_cache: FxHashMap<Vector3<i32>, PathType>,
     region: Option<ChunkRegion>,
 }
 
@@ -55,6 +56,7 @@ impl PathfindingContext {
             mob_position,
             world,
             collision_cache: FxHashMap::default(),
+            land_type_cache: FxHashMap::default(),
             region: None,
         }
     }
@@ -66,6 +68,7 @@ impl PathfindingContext {
             mob_position,
             world,
             collision_cache: FxHashMap::default(),
+            land_type_cache: FxHashMap::default(),
             region: None,
         }
     }
@@ -212,7 +215,18 @@ impl PathfindingContext {
         PathType::Open
     }
 
+    /// Vanilla `WalkNodeEvaluator.getPathTypeStatic`. A search asks for the same position many
+    /// times, and the answer only depends on blocks it already read, so it is kept.
     pub fn get_land_node_type(&mut self, pos: Vector3<i32>) -> PathType {
+        if let Some(&cached) = self.land_type_cache.get(&pos) {
+            return cached;
+        }
+        let land_type = self.compute_land_node_type(pos);
+        self.land_type_cache.insert(pos, land_type);
+        land_type
+    }
+
+    fn compute_land_node_type(&mut self, pos: Vector3<i32>) -> PathType {
         let raw_type = self.get_path_type_from_state(pos);
 
         if raw_type == PathType::Open && pos.y > self.min_y() {
@@ -398,5 +412,6 @@ impl PathfindingContext {
             cache.clear();
         }
         self.collision_cache.clear();
+        self.land_type_cache.clear();
     }
 }
