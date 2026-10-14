@@ -34,6 +34,9 @@ pub mod walk_node_evaluator;
 const MAX_ITERS: usize = 560;
 const TARGET_DISTANCE_MULTIPLIER: f32 = 1.5;
 const NODE_REACH_Y: f64 = 1.0;
+/// Vanilla `PathNavigation.createPath`'s `regionOffset`: how far past the follow range a path
+/// search reads.
+const PATH_REGION_OFFSET: i32 = 8;
 const MAX_YAW_TURN_PER_TICK: f32 = 90.0;
 
 pub struct PathFinder {
@@ -575,7 +578,8 @@ impl PathNavigation {
         let start_block_vec = BlockPos::floored_v(start_pos_f).0;
         let mob_position = Vector3::new(start_block_vec.x, start_block_vec.y, start_block_vec.z);
 
-        let context = PathfindingContext::new(mob_position, entity.entity.world.load_full());
+        let mut context = PathfindingContext::new(mob_position, entity.entity.world.load_full());
+        context.snapshot_region(self.mob_max_follow_range(entity) as i32 + PATH_REGION_OFFSET);
         let mut mob_data = MobData::new(start_pos_f, self.mob_width, self.mob_height, 1.0);
         mob_data.on_ground = entity.entity.on_ground.load(Ordering::Relaxed);
         mob_data.can_swim = self.can_float;

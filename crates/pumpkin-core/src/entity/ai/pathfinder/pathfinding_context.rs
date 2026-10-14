@@ -1,9 +1,12 @@
 use pumpkin_data::{
-    Block, BlockState,
+    Block, BlockState, BlockStateId,
     fluid::Fluid,
     tag::{self, Taggable},
 };
-use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
+use pumpkin_util::math::{
+    boundingbox::BoundingBox, position::BlockPos, vector2::Vector2, vector3::Vector3,
+};
+use pumpkin_world::level::SyncChunk;
 
 use crate::{
     entity::ai::pathfinder::{
@@ -16,11 +19,32 @@ use crate::{
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
+/// The chunks around a path search, taken once like vanilla's `PathNavigationRegion`.
+struct ChunkRegion {
+    min: Vector2<i32>,
+    width: i32,
+    depth: i32,
+    chunks: Vec<Option<SyncChunk>>,
+}
+
+impl ChunkRegion {
+    /// The slot for `chunk`, empty when that chunk isn't loaded; `None` outside the region.
+    fn get(&self, chunk: Vector2<i32>) -> Option<&Option<SyncChunk>> {
+        let x = chunk.x - self.min.x;
+        let z = chunk.y - self.min.y;
+        if x < 0 || z < 0 || x >= self.width || z >= self.depth {
+            return None;
+        }
+        self.chunks.get((z * self.width + x) as usize)
+    }
+}
+
 pub struct PathfindingContext {
     path_type_cache: Option<PathTypeCache>,
     mob_position: Vector3<i32>,
     world: Arc<World>,
     collision_cache: FxHashMap<[u64; 6], bool>,
+    region: Option<ChunkRegion>,
 }
 
 impl PathfindingContext {
@@ -31,6 +55,7 @@ impl PathfindingContext {
             mob_position,
             world,
             collision_cache: FxHashMap::default(),
+            region: None,
         }
     }
 
@@ -41,6 +66,7 @@ impl PathfindingContext {
             mob_position,
             world,
             collision_cache: FxHashMap::default(),
+            region: None,
         }
     }
 
@@ -83,7 +109,7 @@ impl PathfindingContext {
     #[must_use]
     pub fn compute_path_type_from_state(&self, pos: Vector3<i32>) -> PathType {
         let block_pos = pos.as_blockpos();
-        let state_id = self.world.get_block_state_id(&block_pos);
+        let state_id = self.block_state_id(&block_pos);
         let block = Block::from_state_id(state_id);
         let state = BlockState::from_id(state_id);
 
@@ -171,7 +197,11 @@ impl PathfindingContext {
             };
         }
 
-        if !self.is_pathfindable(&block_pos, PathComputationType::Land) {
+        if !self
+            .world
+            .block_registry
+            .is_pathfindable(block, state, PathComputationType::Land)
+        {
             return PathType::Blocked;
         }
 
@@ -244,7 +274,7 @@ impl PathfindingContext {
     #[must_use]
     pub fn get_floor_level(&self, pos: &BlockPos) -> f64 {
         let target = pos.down();
-        let state = self.world.get_block_state(&target);
+        let state = BlockState::from_id(self.block_state_id(&target));
         let max_y = state
             .get_block_collision_shapes_at(&target)
             .map(|s| s.max.y)
@@ -271,7 +301,7 @@ impl PathfindingContext {
         let mut collided = false;
 
         for pos in BlockPos::iterate(min, max) {
-            let state = self.world.get_block_state(&pos);
+            let state = BlockState::from_id(self.block_state_id(&pos));
             if state.is_air() || !state.is_solid() {
                 continue;
             }
@@ -293,27 +323,74 @@ impl PathfindingContext {
 
     #[must_use]
     pub fn is_water(&self, pos: &BlockPos) -> bool {
-        let state_id = self.world.get_block_state_id(pos);
+        let state_id = self.block_state_id(pos);
         let fluid = Fluid::from_state_id(state_id);
         fluid.is_some_and(|f| f.has_tag(&tag::Fluid::MINECRAFT_WATER))
     }
 
     #[must_use]
     pub fn is_air(&self, pos: &BlockPos) -> bool {
-        self.world.get_block_state(pos).is_air()
+        BlockState::from_id(self.block_state_id(pos)).is_air()
     }
 
     #[must_use]
     pub fn get_block_state(&self, pos: &BlockPos) -> &'static BlockState {
-        self.world.get_block_state(pos)
+        BlockState::from_id(self.block_state_id(pos))
     }
 
     #[must_use]
     pub fn is_pathfindable(&self, pos: &BlockPos, computation_type: PathComputationType) -> bool {
-        let (block, state) = self.world.get_block_and_state(pos);
+        let (block, state) = BlockState::from_id_with_block(self.block_state_id(pos));
         self.world
             .block_registry
             .is_pathfindable(block, state, computation_type)
+    }
+
+    /// Takes the chunks within `radius` blocks of the mob for the coming search, as vanilla's
+    /// `PathNavigationRegion` does, so block reads there skip the world's chunk map.
+    pub fn snapshot_region(&mut self, radius: i32) {
+        let min = Vector2::new(
+            (self.mob_position.x - radius) >> 4,
+            (self.mob_position.z - radius) >> 4,
+        );
+        let max = Vector2::new(
+            (self.mob_position.x + radius) >> 4,
+            (self.mob_position.z + radius) >> 4,
+        );
+        let level = &self.world.level;
+        let chunks = (min.y..=max.y)
+            .flat_map(|z| (min.x..=max.x).map(move |x| Vector2::new(x, z)))
+            .map(|chunk| level.read_chunk_sync(&chunk, Arc::clone))
+            .collect();
+        self.region = Some(ChunkRegion {
+            min,
+            width: max.x - min.x + 1,
+            depth: max.y - min.y + 1,
+            chunks,
+        });
+    }
+
+    /// The block at `pos`. Unloaded chunks and positions outside the build limit read as air, as
+    /// `World::get_block_state_id` does.
+    fn block_state_id(&self, pos: &BlockPos) -> BlockStateId {
+        if !self.world.is_in_build_limit(*pos) {
+            return Block::AIR.default_state.id;
+        }
+        let (chunk_pos, relative) = pos.chunk_and_chunk_relative_position();
+        let read = |chunk: &SyncChunk| {
+            chunk
+                .section
+                .get_block_absolute_y(relative.x as usize, relative.y, relative.z as usize)
+        };
+        let id = self
+            .region
+            .as_ref()
+            .and_then(|region| region.get(chunk_pos))
+            .map_or_else(
+                || self.world.level.read_chunk_sync(&chunk_pos, read).flatten(),
+                |chunk| chunk.as_ref().and_then(read),
+            );
+        id.unwrap_or(Block::AIR.default_state.id)
     }
 
     pub fn clear_caches(&mut self) {
