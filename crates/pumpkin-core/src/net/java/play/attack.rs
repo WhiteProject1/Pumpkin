@@ -38,6 +38,10 @@ impl JavaClient {
             ));
             return;
         };
+        // Vanilla's lookup skips removed entities, so a stale id must not reach one.
+        if target.get_entity().is_removed() {
+            return;
+        }
         if let Some(player_victim) = &player_target {
             if player_victim.living_entity.health.load() <= 0.0 {
                 return;

@@ -34,6 +34,10 @@ impl JavaClient {
             .or_else(|| world.get_entity_by_id(entity_id.0));
 
         if let Some(target) = target {
+            // Vanilla's lookup skips removed entities, so a stale id must not reach one.
+            if target.get_entity().is_removed() {
+                return;
+            }
             if player.gamemode.load() == GameMode::Spectator {
                 player.camera_target_id.store(Some(entity_id.0));
                 player.try_send_client_packet(&CSetCamera::new(entity_id));
