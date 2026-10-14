@@ -34,6 +34,12 @@ impl JavaClient {
             return Err(BlockPlacingError::InvalidHand);
         };
 
+        // Behaviours trust the cursor to be inside the clicked block (a firework rocket
+        // spawns at `position + cursor_pos`), so vanilla rejects anything else.
+        if !Self::is_valid_block_hit_location(&cursor_pos) {
+            return Err(BlockPlacingError::InvalidCursorPosition);
+        }
+
         if player.gamemode.load() == GameMode::Spectator {
             let entity = &player.get_entity();
             let world = entity.world.load_full();
@@ -251,6 +257,14 @@ impl JavaClient {
         }
 
         BlockActionResult::Pass
+    }
+
+    /// Vanilla `isValidBlockHitLocation`: finite and in the block, with rounding slack.
+    fn is_valid_block_hit_location(cursor_pos: &Vector3<f32>) -> bool {
+        [cursor_pos.x, cursor_pos.y, cursor_pos.z]
+            .into_iter()
+            .map(f64::from)
+            .all(|component| component.is_finite() && (-1.0e-7..=1.000_000_1).contains(&component))
     }
 
     fn run_is_block_place(

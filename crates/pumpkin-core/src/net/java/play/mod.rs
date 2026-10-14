@@ -116,6 +116,7 @@ pub enum BlockPlacingError {
     InvalidBlockFace,
     BlockOutOfWorld,
     InvalidGamemode,
+    InvalidCursorPosition,
 }
 
 impl std::fmt::Display for BlockPlacingError {
@@ -127,7 +128,10 @@ impl std::fmt::Display for BlockPlacingError {
 impl PumpkinError for BlockPlacingError {
     fn is_kick(&self) -> bool {
         match self {
-            Self::BlockOutOfReach | Self::BlockOutOfWorld | Self::InvalidGamemode => false,
+            Self::BlockOutOfReach
+            | Self::BlockOutOfWorld
+            | Self::InvalidGamemode
+            | Self::InvalidCursorPosition => false,
             Self::InvalidBlockFace | Self::InvalidHand => true,
         }
     }
@@ -135,13 +139,19 @@ impl PumpkinError for BlockPlacingError {
     fn severity(&self) -> Level {
         match self {
             Self::BlockOutOfWorld | Self::InvalidGamemode => Level::TRACE,
-            Self::BlockOutOfReach | Self::InvalidBlockFace | Self::InvalidHand => Level::WARN,
+            Self::BlockOutOfReach
+            | Self::InvalidBlockFace
+            | Self::InvalidHand
+            | Self::InvalidCursorPosition => Level::WARN,
         }
     }
 
     fn client_kick_reason(&self) -> Option<String> {
         match self {
-            Self::BlockOutOfReach | Self::BlockOutOfWorld | Self::InvalidGamemode => None,
+            Self::BlockOutOfReach
+            | Self::BlockOutOfWorld
+            | Self::InvalidGamemode
+            | Self::InvalidCursorPosition => None,
             Self::InvalidBlockFace => Some("Invalid block face".into()),
             Self::InvalidHand => Some("Invalid hand".into()),
         }
